@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "engine",
+    "server",
+    "cli",
+]
+
+# The Tauri `client` app is intentionally NOT a member here: it is its own
+# workspace (client/src-tauri/Cargo.toml declares `[workspace]`) so that the
+# heavy Tauri dependency tree does not slow down building the audio core,
+# server, and headless CLI.

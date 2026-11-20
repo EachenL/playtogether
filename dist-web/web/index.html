@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>网页版 · playTogether</title>
+<meta name="description" content="不用安装，浏览器直接加入 playTogether 排练房间。">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%237c5cff'/%3E%3Cpath d='M9 18v-7M14 21V9M19 17v-4M24 19v-8' stroke='%23fff' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#08080d; --card:rgba(255,255,255,.045); --line:rgba(255,255,255,.10);
+    --fg:#f2f3f7; --dim:#a5a7b6; --dim2:#71737f;
+    --violet:#7c5cff; --cyan:#22d3ee; --green:#3ddc97; --amber:#ffb454; --red:#ff6b6b;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+    background-image:radial-gradient(680px 340px at 6% -10%,rgba(124,92,255,.20),transparent 70%),
+                     radial-gradient(560px 300px at 100% 0%,rgba(34,211,238,.11),transparent 70%);}
+  .wrap{max-width:960px;margin:0 auto;padding:22px 20px 60px}
+  header{display:flex;align-items:center;gap:10px;padding:12px 0 18px}
+  .mark{width:26px;height:26px;border-radius:7px;display:grid;place-items:center;
+    background:linear-gradient(135deg,var(--violet),#4d7cff);box-shadow:0 4px 16px rgba(124,92,255,.45)}
+  .mark svg{width:15px;height:15px}
+  .brand{font-weight:640;letter-spacing:-.01em}
+  header a.back{margin-left:auto;font-size:13px;color:var(--dim);border:1px solid var(--line);
+    border-radius:9px;padding:6px 12px;text-decoration:none}
+  header a.back:hover{color:var(--fg);border-color:rgba(255,255,255,.22)}
+  h1{font-size:clamp(25px,3.6vw,34px);letter-spacing:-.025em;margin:6px 0 10px}
+  h1 span{background:linear-gradient(100deg,#fff,#c9bcff 60%,var(--cyan));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .lede{color:var(--dim);font-size:14.5px;margin:0 0 22px;max-width:64ch}
+  .card{border:1px solid var(--line);border-radius:14px;background:var(--card);padding:18px 20px}
+  .card + .card{margin-top:14px}
+
+  .joinbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  select{appearance:none;padding:10px 12px;border-radius:9px;border:1px solid var(--line);
+    background:rgba(255,255,255,.05);color:var(--fg);font-size:13.5px;font-family:inherit}
+  button{border:0;border-radius:9px;padding:11px 18px;font-size:14px;font-weight:640;color:#fff;
+    cursor:pointer;font-family:inherit;transition:.16s}
+  button.primary{background:linear-gradient(135deg,var(--violet),#4d7cff);box-shadow:0 8px 22px rgba(124,92,255,.34)}
+  button.primary:hover:not(:disabled){transform:translateY(-1px)}
+  button.ghost{background:rgba(255,255,255,.06);border:1px solid var(--line)}
+  button:disabled{opacity:.45;cursor:default}
+  .chip{margin-left:auto;display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600;
+    color:var(--dim);border:1px solid var(--line);border-radius:999px;padding:4px 11px;background:rgba(255,255,255,.03)}
+  .chip::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--dim2)}
+  .chip.on{color:#a9f5cf;border-color:rgba(61,220,151,.4);background:rgba(61,220,151,.10)}
+  .chip.on::before{background:var(--green);box-shadow:0 0 0 3px rgba(61,220,151,.16)}
+  .chip.busy{color:#ffd9a3;border-color:rgba(255,180,84,.4)}
+  .chip.busy::before{background:var(--amber)}
+  #hint{margin:12px 0 0;font-size:12.5px;color:var(--dim2);min-height:18px}
+
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px}
+  @media(max-width:760px){.grid{grid-template-columns:repeat(2,1fr)}}
+  .m{border:1px solid var(--line);border-radius:11px;padding:12px 14px;background:rgba(255,255,255,.03)}
+  .m .k{font-size:11px;color:var(--dim2)}
+  .m .v{margin-top:4px;font-size:20px;font-weight:660;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+  .m .v small{font-size:11px;font-weight:500;color:var(--dim);margin-left:2px}
+  .m .v.good{color:var(--green)}.m .v.warn{color:var(--amber)}.m .v.bad{color:var(--red)}
+
+  .levels{display:grid;gap:10px;margin-top:16px}
+  .lvrow{display:flex;align-items:center;gap:10px}
+  .lvname{font-size:11.5px;color:var(--dim2);width:36px;flex:0 0 auto}
+  .meter{display:flex;gap:3px;height:16px;flex:1}
+  .meter i{flex:1;border-radius:2px;background:rgba(255,255,255,.08);transition:background .1s}
+  .lvval{font-size:11px;color:var(--dim2);font-family:var(--mono);width:52px;text-align:right;flex:0 0 auto}
+
+  #log{margin-top:16px;border-top:1px solid var(--line);padding-top:12px;
+    font-family:var(--mono);font-size:11.5px;color:var(--dim2);max-height:150px;overflow:auto}
+  .log-line{padding:1px 0}
+  .log-line.ok{color:#8ce8bd}
+  .log-line.err{color:#ff9f9f}
+
+  .notes{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px}
+  @media(max-width:760px){.notes{grid-template-columns:1fr}}
+  .note{border:1px solid var(--line);border-radius:12px;padding:15px 17px;background:rgba(255,255,255,.028)}
+  .note h3{margin:0 0 7px;font-size:13px;font-weight:640;color:#dcd8ff;display:flex;gap:7px;align-items:center}
+  .note p{margin:0;font-size:12.8px;color:var(--dim);line-height:1.65}
+  .note code{font-family:var(--mono);font-size:.92em;background:rgba(255,255,255,.07);padding:1px 5px;border-radius:4px}
+  .warnbox{border-color:rgba(255,180,84,.32);background:rgba(255,180,84,.06)}
+  .warnbox h3{color:#ffd9a3}
+  footer{margin-top:26px;font-size:12px;color:var(--dim2);text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round">
+        <path d="M6 14v-4M10 17V7M14 15V9M18 13v-2"/>
+      </svg>
+    </span>
+    <span class="brand">playTogether</span>
+    <a class="back" href="/">← 回主站</a>
+  </header>
+
+  <h1>网页版：<span>不装客户端，直接进房间</span></h1>
+  <p class="lede">
+    浏览器里点一下就能加入乐队排练。技术上浏览器发不了 UDP，所以我们用一条 WebSocket 桥接
+    （浏览器 ↔ <code>jt-webd</code> ↔ 播控服务器）把 PCM 音频转成 <code>JT01</code> 帧——
+    你和桌面端用户进的是<b>同一个房间</b>。
+  </p>
+
+  <div class="card">
+    <div class="joinbar">
+      <select id="mode" aria-label="音频来源">
+        <option value="mic">麦克风（真实排练）</option>
+        <option value="tone">测试音（没有麦克风也能验证）</option>
+      </select>
+      <button id="join" class="primary">加入房间</button>
+      <button id="leave" class="ghost" disabled>离开</button>
+      <span id="state" class="chip">未加入</span>
+    </div>
+    <p id="hint">第一次加入会请求麦克风权限；没有麦克风就选「测试音」，它只发一个 440 Hz 正弦波。</p>
+
+    <div class="grid">
+      <div class="m"><div class="k">链路 RTT（浏览器↔服务器）</div><div class="v" id="m-rtt">—</div></div>
+      <div class="m"><div class="k">已发送帧</div><div class="v" id="m-tx">0</div></div>
+      <div class="m"><div class="k">已接收帧</div><div class="v" id="m-rx">0</div></div>
+      <div class="m"><div class="k">单向延迟估算</div><div class="v" id="m-lat">—</div></div>
+    </div>
+
+    <div class="levels">
+      <div class="lvrow"><span class="lvname">我</span><div class="meter" id="lv-self"></div><span class="lvval" id="lv-self-txt">—</span></div>
+      <div class="lvrow"><span class="lvname">乐队</span><div class="meter" id="lv-peer"></div><span class="lvval" id="lv-peer-txt">—</span></div>
+    </div>
+
+    <div id="log" aria-live="polite"></div>
+  </div>
+
+  <div class="notes">
+    <div class="note warnbox">
+      <h3>只有你自己时不会有声音</h3>
+      <p>服务器的规则是「混别人的声音、排除自己」，所以房间里只有你一个人时是安静的。要听到声音，让另一个人（或用桌面客户端 <code>jt-cli</code>）连上同一台服务器。</p>
+    </div>
+    <div class="note">
+      <h3>网页版延迟比桌面端高</h3>
+      <p>WebSocket 走 TCP + 浏览器音频缓冲，单向大约 <b>60–120 ms</b>，适合听排练、对节奏参考，不适合严格意义上的 &lt;20 ms 合奏。追求低延迟请用桌面客户端。</p>
+    </div>
+    <div class="note">
+      <h3>带宽</h3>
+      <p>不压缩 16-bit PCM：48 kHz × 16 bit ≈ <b>0.75 Mbps</b> 上行、同样下行。网速够用但别用蜂窝数据。</p>
+    </div>
+    <div class="note">
+      <h3>需要 HTTPS 与授权</h3>
+      <p>麦克风要求安全上下文（本站已是 HTTPS）。Safari 对 AudioWorklet 支持较早，推荐 Chrome / Edge；iOS 上建议耳机并注意自动增益。</p>
+    </div>
+  </div>
+
+  <footer>playTogether 网页版（Beta） · 桥接服务 jt-webd · 音频服务 UDP 9000</footer>
+</div>
+
+<script src="jam.js"></script>
+</body>
+</html>

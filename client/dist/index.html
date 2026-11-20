@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>playTogether</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="bar">
+      <span class="logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round">
+          <path d="M6 14v-4M10 17V7M14 15V9M18 13v-2"/>
+        </svg>
+      </span>
+      <span class="name">playTogether</span>
+      <span class="edition">桌面客户端</span>
+      <span class="chip" id="link-state">未连接</span>
+    </header>
+
+    <section class="connect">
+      <label for="server">服务器地址</label>
+      <div class="row">
+        <input id="server" type="text" value="daoway.ai:9000" spellcheck="false"
+               autocomplete="off" autocapitalize="off" />
+        <button id="ping" class="btn ghost">测延迟</button>
+        <button id="start" class="btn primary">连接</button>
+      </div>
+      <p class="hint" id="hint">先点「测延迟」看看网络：不需要麦克风也能测。</p>
+    </section>
+
+    <section class="metrics">
+      <div class="metric">
+        <div class="k">RTT</div>
+        <div class="v" id="m-rtt">—</div>
+        <div class="u">往返</div>
+      </div>
+      <div class="metric">
+        <div class="k">单向延迟估算</div>
+        <div class="v" id="m-ow">—</div>
+        <div class="u">网络 + 缓冲</div>
+      </div>
+      <div class="metric">
+        <div class="k">抖动缓冲</div>
+        <div class="v" id="m-jit">—</div>
+        <div class="u">采样</div>
+      </div>
+    </section>
+
+    <p class="codec">无压缩 16-bit PCM · 48 kHz · 块 256 帧（5.33 ms）</p>
+
+    <section class="levels">
+      <div class="lv">
+        <span class="lv-name">麦克风</span>
+        <div class="meter" id="mic" aria-hidden="true"></div>
+      </div>
+      <div class="lv">
+        <span class="lv-name">乐队</span>
+        <div class="meter" id="peer" aria-hidden="true"></div>
+      </div>
+    </section>
+
+    <footer class="foot">
+      <button id="stop" class="btn danger">断开</button>
+      <span class="target" id="target">目标 &lt; 20 ms</span>
+    </footer>
+  </div>
+
+  <script src="main.js"></script>
+</body>
+</html>

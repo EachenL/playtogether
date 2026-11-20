@@ -1,0 +1,16 @@
+[Unit]
+Description=playTogether WebSocket bridge (jt-webd)
+After=network.target jt-server.service
+
+[Service]
+User=ubuntu
+ExecStart=/usr/bin/python3 /usr/local/bin/jt_webd.py
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+Environment=JT_WEB_PORT=9100
+Environment=JT_SERVER_HOST=127.0.0.1
+Environment=JT_SERVER_PORT=9000
+
+[Install]
+WantedBy=multi-user.target

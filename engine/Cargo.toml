@@ -1,0 +1,9 @@
+[package]
+name = "jt-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Headless client session: cpal capture/playback + UDP streaming"
+
+[dependencies]
+jt-core = { path = "../core" }
+cpal = "0.15"

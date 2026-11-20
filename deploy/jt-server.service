@@ -1,0 +1,15 @@
+[Unit]
+Description=JackTrip-style audio mixing hub (UDP)
+After=network.target
+
+[Service]
+# --echo 已去掉：多客户端混音模式，排除发送者自己
+ExecStart=/home/ubuntu/jt-server --port 9000
+Restart=always
+RestartSec=2
+User=ubuntu
+LimitNOFILE=65536
+# 音频对延迟敏感，不做 CPU/内存限制
+
+[Install]
+WantedBy=multi-user.target

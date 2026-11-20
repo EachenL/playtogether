@@ -1,0 +1,9 @@
+[package]
+name = "jt-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Headless client for testing the audio loop"
+
+[dependencies]
+jt-engine = { path = "../engine" }
+jt-core = { path = "../core" }
