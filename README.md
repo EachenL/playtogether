@@ -1,5 +1,7 @@
 # playTogether
 
+[![CI](https://github.com/EachenL/playtogether/actions/workflows/ci.yml/badge.svg)](https://github.com/EachenL/playtogether/actions/workflows/ci.yml)
+
 **低延迟在线合奏 / 远程排练系统** —— 全 Rust 实现，参考 [JackTrip](https://github.com/jacktrip/jacktrip) 与 [Jamulus](https://github.com/jamulussoftware/jamulus) 的思路：**不压缩 PCM 走 UDP**，把延迟压到「能听出同一个拍子」的量级。
 
 目标：端到端单向延迟 **< 20 ms**（同城），并提供三端接入 —— **桌面客户端、命令行客户端、网页版**，三者进同一个房间。
