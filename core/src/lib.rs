@@ -20,7 +20,7 @@ pub type Sample = i16;
 /// Packet magic bytes, "JT01".
 pub const MAGIC: [u8; 4] = *b"JT01";
 
-/// Wire header size in bytes: magic(4) + client_id(4) + seq(4) + sample_count(4).
+/// Wire header size in bytes: magic(4) + room_id(4) + seq(4) + sample_count(4).
 pub const HEADER_SIZE: usize = 16;
 
 /// One block of mono audio as it travels over the wire.
@@ -37,22 +37,22 @@ impl AudioBlock {
         Self { seq, samples }
     }
 
-    /// Serialize into `out` (clears it first). `client_id` is the sender id;
-    /// the demo uses `0` everywhere and relies on the UDP source address.
+    /// Serialize into `out` (clears it first). `room_id` is the 4-digit
+    /// rehearsal-room code (0000–9999) that scopes this stream to a room.
     ///
     /// Layout (little-endian):
     /// ```text
     /// [0..4)   MAGIC "JT01"
-    /// [4..8)   client_id  u32
+    /// [4..8)   room_id    u32
     /// [8..12)  seq        u32
     /// [12..16) num_samples u32
     /// [16..)   samples    i16 x num_samples
     /// ```
-    pub fn serialize_into(&self, client_id: u32, out: &mut Vec<u8>) {
+    pub fn serialize_into(&self, room_id: u32, out: &mut Vec<u8>) {
         out.clear();
         out.reserve(HEADER_SIZE + self.samples.len() * 2);
         out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&client_id.to_le_bytes());
+        out.extend_from_slice(&room_id.to_le_bytes());
         out.extend_from_slice(&self.seq.to_le_bytes());
         out.extend_from_slice(&(self.samples.len() as u32).to_le_bytes());
         for s in &self.samples {
@@ -60,12 +60,12 @@ impl AudioBlock {
         }
     }
 
-    /// Parse a packet. Returns `(client_id, block)` on success.
+    /// Parse a packet. Returns `(room_id, block)` on success.
     pub fn deserialize(buf: &[u8]) -> Option<(u32, AudioBlock)> {
         if buf.len() < HEADER_SIZE || buf[..4] != MAGIC {
             return None;
         }
-        let client_id = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        let room_id = u32::from_le_bytes(buf[4..8].try_into().ok()?);
         let seq = u32::from_le_bytes(buf[8..12].try_into().ok()?);
         let n = u32::from_le_bytes(buf[12..16].try_into().ok()?) as usize;
         if buf.len() != HEADER_SIZE + n * 2 {
@@ -77,7 +77,7 @@ impl AudioBlock {
             let hi = buf[HEADER_SIZE + i * 2 + 1];
             samples.push(Sample::from_le_bytes([lo, hi]));
         }
-        Some((client_id, AudioBlock { seq, samples }))
+        Some((room_id, AudioBlock { seq, samples }))
     }
 }
 
@@ -97,6 +97,113 @@ pub fn make_ping(timestamp_ms: u64) -> Vec<u8> {
 pub fn parse_ping(buf: &[u8]) -> Option<u64> {
     if buf.len() == 12 && buf[..4] == MAGIC_PING {
         Some(u64::from_le_bytes(buf[4..12].try_into().ok()?))
+    } else {
+        None
+    }
+}
+
+/// "Room full" notification magic, "JTFU".
+pub const MAGIC_FULL: [u8; 4] = *b"JTFU";
+
+/// Build a "room full" notification packet (sent by the server to a client
+/// that tried to join a room that has reached its capacity).
+pub fn make_room_full() -> Vec<u8> {
+    MAGIC_FULL.to_vec()
+}
+
+/// Return true if `buf` is a "room full" notification.
+pub fn parse_room_full(buf: &[u8]) -> bool {
+    buf == MAGIC_FULL
+}
+
+/// "Welcome" magic, "JTWC": server tells a client its assigned id.
+pub const MAGIC_WELCOME: [u8; 4] = *b"JTWC";
+/// "Name" magic, "JTNM": client sets its display name.
+pub const MAGIC_NAME: [u8; 4] = *b"JTNM";
+/// "Roster" magic, "JTRS": server broadcasts the room roster (id + name list).
+pub const MAGIC_ROSTER: [u8; 4] = *b"JTRS";
+/// "Gain" magic, "JTGN": client sets its local gain for one peer.
+pub const MAGIC_GAIN: [u8; 4] = *b"JTGN";
+
+pub fn make_welcome(client_id: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&MAGIC_WELCOME);
+    out.extend_from_slice(&client_id.to_le_bytes());
+    out
+}
+
+pub fn parse_welcome(buf: &[u8]) -> Option<u32> {
+    if buf.len() == 8 && buf[..4] == MAGIC_WELCOME {
+        Some(u32::from_le_bytes(buf[4..8].try_into().ok()?))
+    } else {
+        None
+    }
+}
+
+pub fn make_name(name: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + name.len());
+    out.extend_from_slice(&MAGIC_NAME);
+    out.extend_from_slice(name.as_bytes());
+    out
+}
+
+pub fn parse_name(buf: &[u8]) -> Option<String> {
+    if buf.len() >= 4 && buf[..4] == MAGIC_NAME {
+        String::from_utf8(buf[4..].to_vec()).ok()
+    } else {
+        None
+    }
+}
+
+pub fn make_roster(entries: &[(u32, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&MAGIC_ROSTER);
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for (id, name) in entries {
+        out.extend_from_slice(&id.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+    }
+    out
+}
+
+pub fn parse_roster(buf: &[u8]) -> Option<Vec<(u32, String)>> {
+    if buf.len() < 6 || buf[..4] != MAGIC_ROSTER {
+        return None;
+    }
+    let count = u16::from_le_bytes(buf[4..6].try_into().ok()?) as usize;
+    let mut entries = Vec::with_capacity(count);
+    let mut pos = 6;
+    for _ in 0..count {
+        if pos + 6 > buf.len() {
+            return None;
+        }
+        let id = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?);
+        let nlen = u16::from_le_bytes(buf[pos + 4..pos + 6].try_into().ok()?) as usize;
+        pos += 6;
+        if pos + nlen > buf.len() {
+            return None;
+        }
+        let name = String::from_utf8(buf[pos..pos + nlen].to_vec()).ok()?;
+        pos += nlen;
+        entries.push((id, name));
+    }
+    Some(entries)
+}
+
+pub fn make_gain(peer_id: u32, gain: f32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&MAGIC_GAIN);
+    out.extend_from_slice(&peer_id.to_le_bytes());
+    out.extend_from_slice(&gain.to_le_bytes());
+    out
+}
+
+pub fn parse_gain(buf: &[u8]) -> Option<(u32, f32)> {
+    if buf.len() == 12 && buf[..4] == MAGIC_GAIN {
+        let peer = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        let gain = f32::from_le_bytes(buf[8..12].try_into().ok()?);
+        Some((peer, gain))
     } else {
         None
     }
@@ -129,8 +236,8 @@ mod tests {
         let block = AudioBlock::new(42, vec![-1, 0, 1, 32767, -32768]);
         let mut buf = Vec::new();
         block.serialize_into(7, &mut buf);
-        let (id, parsed) = AudioBlock::deserialize(&buf).unwrap();
-        assert_eq!(id, 7);
+        let (room, parsed) = AudioBlock::deserialize(&buf).unwrap();
+        assert_eq!(room, 7);
         assert_eq!(parsed, block);
     }
 

@@ -38,6 +38,10 @@ FRAME_SAMPLES = 480          # 10 ms @ 48 kHz
 FRAME_BYTES = FRAME_SAMPLES * 2
 MAGIC = b"JT01"
 PING_MAGIC = b"JTPN"
+NAME_MAGIC = b"JTNM"
+GAIN_MAGIC = b"JTGN"
+WELCOME_MAGIC = b"JTWC"
+ROSTER_MAGIC = b"JTRS"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,7 +54,8 @@ class Session:
     """一个浏览器连接 = 一个乐手 = 一个 UDP 源端口。"""
 
     __slots__ = (
-        "ws", "sock", "loop", "seq", "tx", "rx", "rtt_ms", "ping_sent", "buf", "closed",
+        "ws", "sock", "loop", "seq", "tx", "rx", "rtt_ms", "ping_sent", "buf", "closed", "room",
+        "pending_name",
     )
 
     def __init__(self, ws: websockets.WebSocketServerProtocol):
@@ -66,11 +71,13 @@ class Session:
         self.ping_sent: dict[int, float] = {}
         self.buf = bytearray()
         self.closed = False
+        self.room = 0
+        self.pending_name = None
 
     # ---- 出站：PCM → JT01 → UDP ----
     def _encode(self, payload: bytes) -> bytes:
         self.seq = (self.seq + 1) & 0xFFFFFFFF
-        header = MAGIC + struct.pack("<III", 0, self.seq, FRAME_SAMPLES)
+        header = MAGIC + struct.pack("<III", self.room, self.seq, FRAME_SAMPLES)
         return header + payload
 
     async def send_ping(self) -> None:
@@ -94,6 +101,12 @@ class Session:
                     try:
                         await self.loop.sock_sendto(self.sock, self._encode(frame), SERVER_ADDR)
                         self.tx += 1
+                        if self.tx == 1 and self.pending_name is not None:
+                            log.info("sending name=%s after first frame", self.pending_name)
+                            await self.loop.sock_sendto(
+                                self.sock, NAME_MAGIC + self.pending_name.encode("utf-8"), SERVER_ADDR
+                            )
+                            self.pending_name = None
                     except OSError:
                         return
             else:
@@ -101,7 +114,8 @@ class Session:
                     data = json.loads(msg)
                 except (ValueError, TypeError):
                     continue
-                if data.get("type") == "ping":
+                t = data.get("type")
+                if t == "ping":
                     # 应用层 ping：让浏览器自己算出「浏览器 ↔ 服务器」的 RTT
                     try:
                         await self.ws.send(json.dumps({
@@ -112,6 +126,24 @@ class Session:
                     except Exception:
                         return
                     await self.send_ping()
+                elif t == "room":
+                    try:
+                        self.room = int(data.get("room", 0)) & 0xFFFFFFFF
+                    except (ValueError, TypeError):
+                        pass
+                elif t == "name":
+                    # 缓冲名称：等第一帧音频把客户端注册后再发给 jt-server，
+                    # 否则 jt-server 会因「尚未注册」而忽略 JTNM。
+                    self.pending_name = str(data.get("name", ""))[:32]
+                elif t == "gain":
+                    try:
+                        peer = int(data.get("peer", 0))
+                        gain = float(data.get("gain", 1.0))
+                        await self.loop.sock_sendto(
+                            self.sock, GAIN_MAGIC + struct.pack("<If", peer, gain), SERVER_ADDR
+                        )
+                    except (ValueError, TypeError, OSError):
+                        pass
 
     async def pump_udp(self) -> None:
         """服务器 → 浏览器。"""
@@ -126,6 +158,35 @@ class Session:
                 sent = self.ping_sent.pop(ts, None)
                 if sent is not None:
                     self.rtt_ms = (time.monotonic() - sent) * 1000.0
+                continue
+
+            if data[:4] == WELCOME_MAGIC and len(data) == 8:
+                cid = struct.unpack("<I", data[4:8])[0]
+                try:
+                    await self.ws.send(json.dumps({"type": "welcome", "id": cid}))
+                except Exception:
+                    return
+                continue
+
+            if data[:4] == ROSTER_MAGIC and len(data) >= 6:
+                count = struct.unpack("<H", data[4:6])[0]
+                members = []
+                pos = 6
+                for _ in range(count):
+                    if pos + 6 > len(data):
+                        break
+                    cid = struct.unpack("<I", data[pos:pos + 4])[0]
+                    nlen = struct.unpack("<H", data[pos + 4:pos + 6])[0]
+                    pos += 6
+                    if pos + nlen > len(data):
+                        break
+                    name = data[pos:pos + nlen].decode("utf-8", "replace")
+                    pos += nlen
+                    members.append([cid, name])
+                try:
+                    await self.ws.send(json.dumps({"type": "roster", "members": members}))
+                except Exception:
+                    return
                 continue
 
             if data[:4] == MAGIC and len(data) >= 16:

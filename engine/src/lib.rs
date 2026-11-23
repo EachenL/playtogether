@@ -13,8 +13,8 @@
 //! correct behaviour for realtime audio) and let dedicated threads do the I/O.
 
 use std::collections::VecDeque;
-use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -23,6 +23,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use jt_core::{AudioBlock, Sample};
+
+use webrtc_audio_processing::config::EchoCanceller;
+use webrtc_audio_processing::{Config, Processor};
 
 /// Target jitter depth in samples (~one 128-sample block). Playback stays
 /// silent until this much data has buffered, smoothing early jitter.
@@ -35,6 +38,122 @@ const MAX_DEPTH: usize = 4096;
 /// Bounded queue capacity (in blocks) between the audio callback and the
 /// network thread. Overflow drops the block — correct realtime behaviour.
 const CHANNEL_BOUND: usize = 8;
+
+/// Resolve a `host[:port]` string to a `SocketAddr`.
+///
+/// Accepts either a literal IP (`1.14.105.192:9000`) or a domain name
+/// (`daoway.ai:9000`). A bare host without a port defaults to port 9000.
+pub fn resolve_addr(input: &str) -> Result<SocketAddr, std::io::Error> {
+    let trimmed = input.trim();
+    // Fast path: already a literal IP:port.
+    if let Ok(addr) = trimmed.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    // Allow a bare host (no port): default to the standard port.
+    let candidate = if trimmed.contains(':') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}:9000")
+    };
+    candidate
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("cannot resolve '{trimmed}'"),
+            )
+        })
+}
+
+/// Parse a 4-digit rehearsal-room code (0000–9999).
+pub fn parse_room_code(input: &str) -> Result<u32, String> {
+    let t = input.trim();
+    if t.len() != 4 || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("房间号必须是 4 位数字（输入了 '{input}'）"));
+    }
+    Ok(t.parse::<u32>().unwrap())
+}
+
+/// Stream mode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// 排练模式：连续全双工，人人互相听见。
+    Rehearsal,
+    /// 语音对讲：全双工 + 回声消除（AEC），开公放也不啸叫。
+    Voice,
+}
+
+/// A named audio device, for the device picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// Everything needed to start a client session.
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    pub server: SocketAddr,
+    pub room_id: u32,
+    pub mode: Mode,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+}
+
+/// Enumerate available input devices.
+pub fn list_input_devices() -> Vec<DeviceInfo> {
+    let host = cpal::default_host();
+    let default = host.default_input_device().and_then(|d| d.name().ok());
+    host.input_devices()
+        .map(|devs| {
+            devs.filter_map(|d| {
+                d.name().ok().map(|name| DeviceInfo {
+                    is_default: Some(&name) == default.as_ref(),
+                    name,
+                })
+            })
+            .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Enumerate available output devices.
+pub fn list_output_devices() -> Vec<DeviceInfo> {
+    let host = cpal::default_host();
+    let default = host.default_output_device().and_then(|d| d.name().ok());
+    host.output_devices()
+        .map(|devs| {
+            devs.filter_map(|d| {
+                d.name().ok().map(|name| DeviceInfo {
+                    is_default: Some(&name) == default.as_ref(),
+                    name,
+                })
+            })
+            .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn find_input_device(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
+    match name {
+        None => host.default_input_device(),
+        Some(n) => host
+            .input_devices()
+            .ok()?
+            .find(|d| d.name().ok().as_deref() == Some(n)),
+    }
+}
+
+fn find_output_device(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
+    match name {
+        None => host.default_output_device(),
+        Some(n) => host
+            .output_devices()
+            .ok()?
+            .find(|d| d.name().ok().as_deref() == Some(n)),
+    }
+}
 
 /// Sample-level FIFO shared between the network receive thread and the output
 /// audio callback.
@@ -72,29 +191,95 @@ impl SampleFifo {
     }
 }
 
+/// WebRTC AEC3 echo-cancellation state, shared between the output (render) and
+/// input (capture) audio callbacks. Used only in voice mode (full-duplex with
+/// echo cancellation so speakerphone playback doesn't feed back into the mic).
+struct AecState {
+    processor: Processor,
+    render: VecDeque<f32>,
+    capture: VecDeque<f32>,
+    frame_size: usize,
+}
+
+impl AecState {
+    fn new(sample_rate_hz: u32) -> Result<Self, Box<dyn std::error::Error>> {
+        let processor = Processor::new(sample_rate_hz)?;
+        let config = Config {
+            echo_canceller: Some(EchoCanceller::default()),
+            ..Default::default()
+        };
+        processor.set_config(config);
+        let frame_size = processor.num_samples_per_frame();
+        Ok(Self {
+            processor,
+            render: VecDeque::new(),
+            capture: VecDeque::new(),
+            frame_size,
+        })
+    }
+
+    /// Feed the played (render) samples; capped to bound memory (~500 ms).
+    fn push_render(&mut self, samples: &[Sample]) {
+        for &s in samples {
+            self.render.push_back(s as f32 / 32768.0);
+        }
+        let max = self.frame_size * 50;
+        while self.render.len() > max {
+            self.render.pop_front();
+        }
+    }
+
+    /// Feed captured samples; returns echo-cancelled output (whole frames only).
+    fn process_capture(&mut self, samples: &[Sample]) -> Vec<Sample> {
+        for &s in samples {
+            self.capture.push_back(s as f32 / 32768.0);
+        }
+        let max = self.frame_size * 50;
+        while self.capture.len() > max {
+            self.capture.pop_front();
+        }
+        let mut out = Vec::with_capacity(samples.len());
+        while self.render.len() >= self.frame_size && self.capture.len() >= self.frame_size {
+            let mut render_frame = vec![Vec::with_capacity(self.frame_size)];
+            let mut capture_frame = vec![Vec::with_capacity(self.frame_size)];
+            for _ in 0..self.frame_size {
+                render_frame[0].push(self.render.pop_front().unwrap());
+                capture_frame[0].push(self.capture.pop_front().unwrap());
+            }
+            let _ = self.processor.process_render_frame(&mut render_frame);
+            let _ = self.processor.process_capture_frame(&mut capture_frame);
+            for &v in &capture_frame[0] {
+                out.push((v.clamp(-1.0, 1.0) * 32767.0) as Sample);
+            }
+        }
+        out
+    }
+}
+
 /// A running client session. Dropping it stops streaming and joins threads.
 pub struct ClientSession {
     stop: Arc<AtomicBool>,
     tx: Option<SyncSender<Vec<Sample>>>,
-    _socket: Arc<UdpSocket>,
+    socket: Arc<UdpSocket>,
     _streams: Vec<cpal::Stream>,
     handles: Vec<JoinHandle<()>>,
     fifo: SampleFifo,
     rtt_ms: Arc<AtomicU64>,
     sample_rate: f64,
     buffer_frames: f64,
+    talking: Arc<AtomicBool>,
+    own_id: Arc<AtomicU32>,
+    roster: Arc<Mutex<Vec<(u32, String)>>>,
 }
 
 impl ClientSession {
-    /// Start capturing, streaming to `server`, and playback.
-    pub fn start(server: SocketAddr) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Start capturing, streaming, and playback, according to `config`.
+    pub fn start(config: SessionConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let host = cpal::default_host();
 
-        let in_dev = host
-            .default_input_device()
+        let in_dev = find_input_device(&host, config.input_device.as_deref())
             .ok_or("no input device found")?;
-        let out_dev = host
-            .default_output_device()
+        let out_dev = find_output_device(&host, config.output_device.as_deref())
             .ok_or("no output device found")?;
 
         let in_cfg = in_dev.default_input_config()?;
@@ -105,11 +290,23 @@ impl ClientSession {
 
         // UDP socket, connected so `recv` only accepts packets from the server.
         let socket = Arc::new(UdpSocket::bind("0.0.0.0:0")?);
-        socket.connect(server)?;
+        socket.connect(config.server)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let fifo = SampleFifo::new();
         let rtt_ms = Arc::new(AtomicU64::new(0));
+        // Full-duplex: both modes always stream. Voice mode additionally runs
+        // AEC (echo cancellation) so speaker playback doesn't feed back.
+        let mode = config.mode;
+        let talking = Arc::new(AtomicBool::new(true));
+        let aec: Option<Arc<Mutex<AecState>>> = if mode == Mode::Voice {
+            Some(Arc::new(Mutex::new(AecState::new(jt_core::SAMPLE_RATE_HZ)?)))
+        } else {
+            None
+        };
+        let room_id = config.room_id;
+        let own_id = Arc::new(AtomicU32::new(0));
+        let roster = Arc::new(Mutex::new(Vec::<(u32, String)>::new()));
 
         // Latency model inputs: sample rate and per-stream buffer size.
         let sample_rate = in_cfg.sample_rate().0 as f64;
@@ -124,16 +321,23 @@ impl ClientSession {
         // --- network sender thread ---
         let send_stop = stop.clone();
         let send_socket = socket.clone();
+        let send_talking = talking.clone();
         let send_handle = thread::spawn(move || {
             let mut seq: u32 = 0;
             let mut last_ping = Instant::now();
             while !send_stop.load(Ordering::Relaxed) {
                 match rx.recv_timeout(Duration::from_millis(20)) {
                     Ok(samples) => {
-                        let block = AudioBlock::new(seq, samples);
+                        // In voice mode, send silence while not talking.
+                        let out = if send_talking.load(Ordering::Relaxed) {
+                            samples
+                        } else {
+                            vec![0; samples.len()]
+                        };
+                        let block = AudioBlock::new(seq, out);
                         seq = seq.wrapping_add(1);
                         let mut buf = Vec::new();
-                        block.serialize_into(0, &mut buf);
+                        block.serialize_into(room_id, &mut buf);
                         let _ = send_socket.send(&buf);
                     }
                     Err(RecvTimeoutError::Timeout) => {}
@@ -156,6 +360,8 @@ impl ClientSession {
         let recv_socket = socket.clone();
         let recv_fifo = fifo.clone();
         let recv_rtt = rtt_ms.clone();
+        let recv_own_id = own_id.clone();
+        let recv_roster = roster.clone();
         let recv_handle = thread::spawn(move || {
             let mut buf = [0u8; 65536];
             let _ = recv_socket.set_read_timeout(Some(Duration::from_millis(20)));
@@ -168,6 +374,10 @@ impl ClientSession {
                                 .unwrap()
                                 .as_millis() as u64;
                             recv_rtt.store(now_ms.saturating_sub(ts), Ordering::Relaxed);
+                        } else if let Some(id) = jt_core::parse_welcome(&buf[..n]) {
+                            recv_own_id.store(id, Ordering::Relaxed);
+                        } else if let Some(entries) = jt_core::parse_roster(&buf[..n]) {
+                            *recv_roster.lock().unwrap() = entries;
                         } else if let Some((_, block)) = AudioBlock::deserialize(&buf[..n]) {
                             recv_fifo.push(&block.samples);
                         }
@@ -178,10 +388,10 @@ impl ClientSession {
         });
 
         // --- input stream (mic -> channel) ---
-        let input_stream = build_input_stream(&in_dev, &in_cfg, tx.clone())?;
+        let input_stream = build_input_stream(&in_dev, &in_cfg, tx.clone(), aec.clone())?;
 
         // --- output stream (jitter buffer -> speaker) ---
-        let output_stream = build_output_stream(&out_dev, &out_cfg, fifo.clone())?;
+        let output_stream = build_output_stream(&out_dev, &out_cfg, fifo.clone(), aec.clone())?;
 
         input_stream.play()?;
         output_stream.play()?;
@@ -189,13 +399,16 @@ impl ClientSession {
         Ok(Self {
             stop,
             tx: Some(tx),
-            _socket: socket,
+            socket,
             _streams: vec![input_stream, output_stream],
             handles: vec![send_handle, recv_handle],
             fifo,
             rtt_ms,
             sample_rate,
             buffer_frames,
+            talking,
+            own_id,
+            roster,
         })
     }
 
@@ -220,6 +433,38 @@ impl ClientSession {
         let jitter = TARGET_DEPTH as f64 / self.sample_rate * 1000.0;
         network + 2.0 * block + jitter
     }
+
+    /// Set whether this client is currently "talking". In voice mode this gates
+    /// audio (silence while not talking); in rehearsal mode it is ignored
+    /// (always talking).
+    pub fn set_talking(&self, talking: bool) {
+        self.talking.store(talking, Ordering::Relaxed);
+    }
+
+    /// Whether this client is currently talking.
+    pub fn talking(&self) -> bool {
+        self.talking.load(Ordering::Relaxed)
+    }
+
+    /// Announce this client's display name to the server.
+    pub fn set_name(&self, name: &str) {
+        let _ = self.socket.send(&jt_core::make_name(name));
+    }
+
+    /// Set this client's local gain for one peer (peer client id).
+    pub fn set_gain(&self, peer_id: u32, gain: f32) {
+        let _ = self.socket.send(&jt_core::make_gain(peer_id, gain));
+    }
+
+    /// This client's server-assigned id (0 until the welcome arrives).
+    pub fn own_id(&self) -> u32 {
+        self.own_id.load(Ordering::Relaxed)
+    }
+
+    /// Current room roster as `(client_id, name)` pairs.
+    pub fn roster(&self) -> Vec<(u32, String)> {
+        self.roster.lock().unwrap().clone()
+    }
 }
 
 impl Drop for ClientSession {
@@ -241,34 +486,59 @@ fn build_input_stream(
     device: &cpal::Device,
     cfg: &cpal::SupportedStreamConfig,
     tx: SyncSender<Vec<Sample>>,
+    aec: Option<Arc<Mutex<AecState>>>,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     let channels = cfg.channels() as usize;
     let config = cfg.config();
     let stream = match cfg.sample_format() {
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &config,
-            move |data: &[i16], _| {
-                let _ = tx.try_send(mono_i16_from_i16(data, channels));
-            },
-            err_fn,
-            None,
-        )?,
-        cpal::SampleFormat::U16 => device.build_input_stream(
-            &config,
-            move |data: &[u16], _| {
-                let _ = tx.try_send(mono_i16_from_u16(data, channels));
-            },
-            err_fn,
-            None,
-        )?,
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &config,
-            move |data: &[f32], _| {
-                let _ = tx.try_send(mono_i16_from_f32(data, channels));
-            },
-            err_fn,
-            None,
-        )?,
+        cpal::SampleFormat::I16 => {
+            let a = aec.clone();
+            device.build_input_stream(
+                &config,
+                move |data: &[i16], _| {
+                    let mono = mono_i16_from_i16(data, channels);
+                    let out = match &a {
+                        Some(aec) => aec.lock().unwrap().process_capture(&mono),
+                        None => mono,
+                    };
+                    let _ = tx.try_send(out);
+                },
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::U16 => {
+            let a = aec.clone();
+            device.build_input_stream(
+                &config,
+                move |data: &[u16], _| {
+                    let mono = mono_i16_from_u16(data, channels);
+                    let out = match &a {
+                        Some(aec) => aec.lock().unwrap().process_capture(&mono),
+                        None => mono,
+                    };
+                    let _ = tx.try_send(out);
+                },
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::F32 => {
+            let a = aec.clone();
+            device.build_input_stream(
+                &config,
+                move |data: &[f32], _| {
+                    let mono = mono_i16_from_f32(data, channels);
+                    let out = match &a {
+                        Some(aec) => aec.lock().unwrap().process_capture(&mono),
+                        None => mono,
+                    };
+                    let _ = tx.try_send(out);
+                },
+                err_fn,
+                None,
+            )?
+        }
         other => return Err(format!("unsupported input sample format: {:?}", other).into()),
     };
     Ok(stream)
@@ -278,28 +548,41 @@ fn build_output_stream(
     device: &cpal::Device,
     cfg: &cpal::SupportedStreamConfig,
     fifo: SampleFifo,
+    aec: Option<Arc<Mutex<AecState>>>,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     let channels = cfg.channels() as usize;
     let config = cfg.config();
     let stream = match cfg.sample_format() {
-        cpal::SampleFormat::I16 => device.build_output_stream(
-            &config,
-            move |data: &mut [i16], _| write_i16(data, channels, &fifo),
-            err_fn,
-            None,
-        )?,
-        cpal::SampleFormat::U16 => device.build_output_stream(
-            &config,
-            move |data: &mut [u16], _| write_u16(data, channels, &fifo),
-            err_fn,
-            None,
-        )?,
-        cpal::SampleFormat::F32 => device.build_output_stream(
-            &config,
-            move |data: &mut [f32], _| write_f32(data, channels, &fifo),
-            err_fn,
-            None,
-        )?,
+        cpal::SampleFormat::I16 => {
+            let f = fifo.clone();
+            let a = aec.clone();
+            device.build_output_stream(
+                &config,
+                move |data: &mut [i16], _| write_i16(data, channels, &f, a.as_deref()),
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::U16 => {
+            let f = fifo.clone();
+            let a = aec.clone();
+            device.build_output_stream(
+                &config,
+                move |data: &mut [u16], _| write_u16(data, channels, &f, a.as_deref()),
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::F32 => {
+            let f = fifo.clone();
+            let a = aec.clone();
+            device.build_output_stream(
+                &config,
+                move |data: &mut [f32], _| write_f32(data, channels, &f, a.as_deref()),
+                err_fn,
+                None,
+            )?
+        }
         other => return Err(format!("unsupported output sample format: {:?}", other).into()),
     };
     Ok(stream)
@@ -338,27 +621,50 @@ fn mono_i16_from_f32(data: &[f32], channels: usize) -> Vec<Sample> {
         .collect()
 }
 
-fn write_i16(data: &mut [i16], channels: usize, fifo: &SampleFifo) {
-    for frame in data.chunks_mut(channels) {
-        let s = fifo.pop();
+fn write_i16(data: &mut [i16], channels: usize, fifo: &SampleFifo, aec: Option<&Mutex<AecState>>) {
+    let n = data.len() / channels;
+    let mut mono = Vec::with_capacity(n);
+    for _ in 0..n {
+        mono.push(fifo.pop());
+    }
+    if let Some(a) = aec {
+        a.lock().unwrap().push_render(&mono);
+    }
+    for (i, frame) in data.chunks_mut(channels).enumerate() {
         for c in frame.iter_mut() {
-            *c = s;
+            *c = mono[i];
         }
     }
 }
 
-fn write_u16(data: &mut [u16], channels: usize, fifo: &SampleFifo) {
-    for frame in data.chunks_mut(channels) {
-        let v = (fifo.pop() as i32 + 32768) as u16;
+fn write_u16(data: &mut [u16], channels: usize, fifo: &SampleFifo, aec: Option<&Mutex<AecState>>) {
+    let n = data.len() / channels;
+    let mut mono = Vec::with_capacity(n);
+    for _ in 0..n {
+        mono.push(fifo.pop());
+    }
+    if let Some(a) = aec {
+        a.lock().unwrap().push_render(&mono);
+    }
+    for (i, frame) in data.chunks_mut(channels).enumerate() {
+        let v = (mono[i] as i32 + 32768) as u16;
         for c in frame.iter_mut() {
             *c = v;
         }
     }
 }
 
-fn write_f32(data: &mut [f32], channels: usize, fifo: &SampleFifo) {
-    for frame in data.chunks_mut(channels) {
-        let v = fifo.pop() as f32 / 32768.0;
+fn write_f32(data: &mut [f32], channels: usize, fifo: &SampleFifo, aec: Option<&Mutex<AecState>>) {
+    let n = data.len() / channels;
+    let mut mono = Vec::with_capacity(n);
+    for _ in 0..n {
+        mono.push(fifo.pop());
+    }
+    if let Some(a) = aec {
+        a.lock().unwrap().push_render(&mono);
+    }
+    for (i, frame) in data.chunks_mut(channels).enumerate() {
+        let v = mono[i] as f32 / 32768.0;
         for c in frame.iter_mut() {
             *c = v;
         }
@@ -396,5 +702,23 @@ mod tests {
         let v = vec![0i16; MAX_DEPTH + 100];
         f.push(&v);
         assert!(f.depth() <= MAX_DEPTH);
+    }
+
+    #[test]
+    fn aec_processes_frames() {
+        let mut aec = AecState::new(48_000).expect("AEC init");
+        let fs = aec.frame_size;
+        let render: Vec<i16> = (0..fs)
+            .map(|i| ((i as f32 / 40.0).cos() * 0.5 * 32767.0) as i16)
+            .collect();
+        let capture: Vec<i16> = (0..fs)
+            .map(|i| ((i as f32 / 20.0).sin() * 0.3 * 32767.0) as i16)
+            .collect();
+
+        for _ in 0..5 {
+            aec.push_render(&render);
+            let out = aec.process_capture(&capture);
+            assert_eq!(out.len(), fs, "AEC must output one full frame");
+        }
     }
 }

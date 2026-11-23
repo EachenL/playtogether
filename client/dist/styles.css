@@ -234,3 +234,61 @@ input:focus { border-color: rgba(124, 92, 255, 0.55); background: rgba(124, 92, 
 
 .target.ok { color: var(--green); }
 .target.warn { color: var(--amber); }
+
+/* ── mode + devices + PTT ───────────────── */
+.seg { gap: 8px; }
+.seg-opt {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 12.5px;
+  color: var(--dim);
+  cursor: pointer;
+}
+.seg-opt input { display: none; }
+.seg-opt:has(input:checked) {
+  color: #d7ccff;
+  border-color: rgba(124, 92, 255, 0.55);
+  background: rgba(124, 92, 255, 0.12);
+}
+
+.devices select {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 9px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--fg);
+  font-size: 12px;
+  font-family: var(--sans);
+  outline: none;
+}
+
+.btn.talk {
+  background: linear-gradient(135deg, #12b76a, #3ddc97);
+  box-shadow: 0 6px 18px rgba(61, 220, 151, 0.30);
+  flex: 0 0 auto;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+}
+.btn.talk:active { transform: scale(0.96); }
+
+/* ── members / roster ─────────────────── */
+.members {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  padding: 10px 12px;
+  background: var(--panel);
+  margin-top: 8px;
+}
+.members-title { font-size: 11px; color: var(--dim2); margin-bottom: 6px; }
+.member { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
+.member-name { font-size: 12.5px; flex: 0 0 auto; min-width: 76px; }
+.gain { flex: 1; accent-color: var(--violet); }

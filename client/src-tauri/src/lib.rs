@@ -6,18 +6,22 @@
 //! thread for its whole lifetime, and the Tauri commands talk to it over a
 //! plain `mpsc` channel (which IS `Send`). This avoids any `unsafe`.
 
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::ToSocketAddrs;
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use jt_engine::ClientSession;
+use jt_engine::{ClientSession, Mode, SessionConfig};
 
 /// Messages the GUI sends to the engine thread.
 enum Cmd {
-    Start(SocketAddr, Sender<String>),
+    Start(SessionConfig, Sender<String>),
     Stop,
     Status(Sender<String>),
+    SetTalking(bool),
+    SetName(String),
+    SetGain(u32, f32),
+    Roster(Sender<serde_json::Value>),
 }
 
 static CMD_TX: OnceLock<Sender<Cmd>> = OnceLock::new();
@@ -35,16 +39,47 @@ fn engine_loop(rx: mpsc::Receiver<Cmd>) {
     let mut session: Option<ClientSession> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            Cmd::Start(addr, resp) => {
+            Cmd::Start(config, resp) => {
                 session = None; // stop any existing session first
-                let msg = match ClientSession::start(addr) {
+                let room = config.room_id;
+                let server = config.server;
+                let msg = match ClientSession::start(config) {
                     Ok(s) => {
                         session = Some(s);
-                        format!("streaming to {addr}")
+                        format!("已进入房间 {room:04} · streaming to {server}")
                     }
                     Err(e) => format!("failed: {e}"),
                 };
                 let _ = resp.send(msg);
+            }
+            Cmd::SetTalking(t) => {
+                if let Some(s) = &session {
+                    s.set_talking(t);
+                }
+            }
+            Cmd::SetName(name) => {
+                if let Some(s) = &session {
+                    s.set_name(&name);
+                }
+            }
+            Cmd::SetGain(peer, gain) => {
+                if let Some(s) = &session {
+                    s.set_gain(peer, gain);
+                }
+            }
+            Cmd::Roster(resp) => {
+                let v = match &session {
+                    Some(s) => serde_json::json!({
+                        "own_id": s.own_id(),
+                        "members": s
+                            .roster()
+                            .iter()
+                            .map(|(id, name)| serde_json::json!({ "id": id, "name": name }))
+                            .collect::<Vec<_>>(),
+                    }),
+                    None => serde_json::json!({ "own_id": 0, "members": [] }),
+                };
+                let _ = resp.send(v);
             }
             Cmd::Stop => {
                 session = None; // Drop stops the streams and joins threads
@@ -66,11 +101,29 @@ fn engine_loop(rx: mpsc::Receiver<Cmd>) {
 }
 
 #[tauri::command]
-fn start_session(server: String) -> Result<String, String> {
-    let addr: SocketAddr = server.parse().map_err(|e| format!("invalid address: {e}"))?;
+fn start_session(
+    server: String,
+    room: String,
+    mode: String,
+    input_device: Option<String>,
+    output_device: Option<String>,
+) -> Result<String, String> {
+    let addr = jt_engine::resolve_addr(&server).map_err(|e| format!("invalid address: {e}"))?;
+    let room_id = jt_engine::parse_room_code(&room).map_err(|e| e.to_string())?;
+    let mode = match mode.as_str() {
+        "voice" => Mode::Voice,
+        _ => Mode::Rehearsal,
+    };
+    let config = SessionConfig {
+        server: addr,
+        room_id,
+        mode,
+        input_device,
+        output_device,
+    };
     let (tx, rx) = mpsc::channel();
     cmd_tx()
-        .send(Cmd::Start(addr, tx))
+        .send(Cmd::Start(config, tx))
         .map_err(|e| e.to_string())?;
     rx.recv_timeout(Duration::from_millis(1000))
         .map_err(|e| e.to_string())
@@ -130,6 +183,54 @@ fn ping_server(server: String) -> Result<String, String> {
     }
 }
 
+/// List audio input/output devices for the local device picker.
+#[tauri::command]
+fn list_devices() -> Result<serde_json::Value, String> {
+    let inputs = jt_engine::list_input_devices();
+    let outputs = jt_engine::list_output_devices();
+    Ok(serde_json::json!({
+        "inputs": inputs
+            .iter()
+            .map(|d| serde_json::json!({ "name": d.name, "is_default": d.is_default }))
+            .collect::<Vec<_>>(),
+        "outputs": outputs
+            .iter()
+            .map(|d| serde_json::json!({ "name": d.name, "is_default": d.is_default }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// Push-to-talk / mute control for voice mode.
+#[tauri::command]
+fn set_talking(talking: bool) -> Result<(), String> {
+    cmd_tx()
+        .send(Cmd::SetTalking(talking))
+        .map_err(|e| e.to_string())
+}
+
+/// Set this client's display name.
+#[tauri::command]
+fn set_name(name: String) -> Result<(), String> {
+    cmd_tx().send(Cmd::SetName(name)).map_err(|e| e.to_string())
+}
+
+/// Set this client's local gain for one peer.
+#[tauri::command]
+fn set_gain(peer: u32, gain: f32) -> Result<(), String> {
+    cmd_tx()
+        .send(Cmd::SetGain(peer, gain))
+        .map_err(|e| e.to_string())
+}
+
+/// Fetch the current room roster (own id + member id/name list).
+#[tauri::command]
+fn get_roster() -> Result<serde_json::Value, String> {
+    let (tx, rx) = mpsc::channel();
+    cmd_tx().send(Cmd::Roster(tx)).map_err(|e| e.to_string())?;
+    rx.recv_timeout(Duration::from_millis(500))
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -137,7 +238,12 @@ pub fn run() {
             start_session,
             stop_session,
             session_status,
-            ping_server
+            ping_server,
+            list_devices,
+            set_talking,
+            set_name,
+            set_gain,
+            get_roster
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

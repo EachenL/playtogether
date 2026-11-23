@@ -20,6 +20,18 @@
     </header>
 
     <section class="connect">
+      <label for="room">排练室房间号（4 位数字）</label>
+      <div class="row">
+        <input id="room" type="text" value="0000" maxlength="4" inputmode="numeric" pattern="\d{4}"
+               spellcheck="false" autocomplete="off" autocapitalize="off" />
+      </div>
+
+      <label for="name">我的名称</label>
+      <div class="row">
+        <input id="name" type="text" value="乐手" maxlength="16"
+               spellcheck="false" autocomplete="off" autocapitalize="off" />
+      </div>
+
       <label for="server">服务器地址</label>
       <div class="row">
         <input id="server" type="text" value="daoway.ai:9000" spellcheck="false"
@@ -27,6 +39,19 @@
         <button id="ping" class="btn ghost">测延迟</button>
         <button id="start" class="btn primary">连接</button>
       </div>
+
+      <label>模式</label>
+      <div class="row seg">
+        <label class="seg-opt"><input type="radio" name="mode" value="rehearsal" checked> 排练</label>
+        <label class="seg-opt"><input type="radio" name="mode" value="voice"> 语音对讲</label>
+      </div>
+
+      <label>本地设备</label>
+      <div class="row devices">
+        <select id="input-device" title="输入（麦克风）"></select>
+        <select id="output-device" title="输出（耳机/扬声器）"></select>
+      </div>
+
       <p class="hint" id="hint">先点「测延迟」看看网络：不需要麦克风也能测。</p>
     </section>
 
@@ -61,7 +86,13 @@
       </div>
     </section>
 
+    <section class="members" id="members" style="display:none">
+      <div class="members-title">排练室成员</div>
+      <div id="member-list"></div>
+    </section>
+
     <footer class="foot">
+      <button id="ptt" class="btn talk" disabled style="display:none">静音</button>
       <button id="stop" class="btn danger">断开</button>
       <span class="target" id="target">目标 &lt; 20 ms</span>
     </footer>
