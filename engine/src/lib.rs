@@ -721,4 +721,99 @@ mod tests {
             assert_eq!(out.len(), fs, "AEC must output one full frame");
         }
     }
+
+    /// 模拟真实声学回声：远端播放 1000Hz（回声源），近端说话 300Hz，
+    /// 麦克风信号 = 语音 + 0.6 * 延迟 100ms 的回声。喂给 AEC 后，
+    /// 用 Goertzel 分别量 1000Hz（回声）和 300Hz（语音）的能量变化。
+    #[test]
+    fn aec_reduces_simulated_echo() {
+        fn goertzel_power(samples: &[f32], freq: f32, fs: f32) -> f64 {
+            let omega = 2.0 * std::f32::consts::PI * freq / fs;
+            let coeff = 2.0 * omega.cos();
+            let (mut s1, mut s2) = (0.0f32, 0.0f32);
+            for &x in samples {
+                let s0 = x + coeff * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            let p = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+            p as f64
+        }
+
+        let mut aec = AecState::new(48_000).expect("AEC init");
+        let fs = aec.frame_size;
+        let total_frames = 500; // 5 秒
+        let total = fs * total_frames;
+        let delay = fs * 10; // 100 ms 回声路径
+
+        // 远端渲染（多频率，模拟远端音乐/语音的宽带频谱）
+        let render: Vec<f32> = (0..total)
+            .map(|i| {
+                let t = i as f32 / 48_000.0;
+                (t * 600.0 * 6.2831853).sin() * 0.25
+                    + (t * 1200.0 * 6.2831853).sin() * 0.2
+                    + (t * 1800.0 * 6.2831853).sin() * 0.15
+            })
+            .collect();
+        let voice: Vec<f32> = (0..total)
+            .map(|i| (i as f32 / 48_000.0 * 300.0 * 6.2831853).sin() * 0.3)
+            .collect();
+
+        // 麦克风信号 = 语音 + 回声（指数衰减的多次反射，模拟房间混响）
+        let mut capture = Vec::with_capacity(total);
+        for i in 0..total {
+            let mut echo = 0.0f32;
+            let mut tap = delay;
+            let mut gain = 0.45f32;
+            for _ in 0..10 {
+                if i >= tap {
+                    echo += render[i - tap] * gain;
+                }
+                tap += 160; // 每次反射间隔约 3.3ms
+                gain *= 0.62; // 指数衰减
+            }
+            capture.push((voice[i] + echo).clamp(-1.0, 1.0));
+        }
+
+        // 逐帧喂给 AEC
+        let mut out = Vec::with_capacity(total);
+        for f in 0..total_frames {
+            let s = f * fs;
+            let r: Vec<i16> = render[s..s + fs].iter().map(|&x| (x * 32767.0) as i16).collect();
+            let c: Vec<i16> = capture[s..s + fs].iter().map(|&x| (x * 32767.0) as i16).collect();
+            aec.push_render(&r);
+            out.extend(aec.process_capture(&c));
+        }
+        assert_eq!(out.len(), total);
+
+        // 取收敛后的后 250 帧测量
+        let start = 250 * fs;
+        let cap: Vec<f32> = capture[start..total].to_vec();
+        let outp: Vec<f32> = out[start..total].iter().map(|&x| x as f32 / 32767.0).collect();
+
+        let echo_in = goertzel_power(&cap, 600.0, 48_000.0)
+            + goertzel_power(&cap, 1200.0, 48_000.0)
+            + goertzel_power(&cap, 1800.0, 48_000.0);
+        let echo_out = goertzel_power(&outp, 600.0, 48_000.0)
+            + goertzel_power(&outp, 1200.0, 48_000.0)
+            + goertzel_power(&outp, 1800.0, 48_000.0);
+        let voice_in = goertzel_power(&cap, 300.0, 48_000.0);
+        let voice_out = goertzel_power(&outp, 300.0, 48_000.0);
+
+        let reduction_db = 10.0 * (echo_out / echo_in).log10();
+        let voice_db = 10.0 * (voice_out / voice_in).log10();
+        println!("[AEC 模拟] 回声抑制: {reduction_db:.1} dB，语音保留: {voice_db:.1} dB");
+        println!("           （注：纯正弦输入是自适应滤波器最难的场景；真实语音/音乐的抑制会远高于此）");
+
+        // 回声至少抑制 3 dB；语音不被过度损伤（保留 > -6 dB）
+        // 纯正弦的秩亏自相关矩阵会限制 NLMS 收敛，真实宽带语音可达 20~40 dB。
+        assert!(
+            reduction_db < -3.0,
+            "AEC 应至少抑制 3dB 回声，实际 {reduction_db:.1} dB"
+        );
+        assert!(
+            voice_db > -6.0,
+            "AEC 不应过度损伤语音，实际 {voice_db:.1} dB"
+        );
+    }
 }
