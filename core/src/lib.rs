@@ -209,6 +209,57 @@ pub fn parse_gain(buf: &[u8]) -> Option<(u32, f32)> {
     }
 }
 
+/// 音乐控制 magic, "JTMU"：同步播放内置 demo 伴奏。
+pub const MAGIC_MUSIC: [u8; 4] = *b"JTMU";
+/// 录音控制 magic, "JTRC"：开始/停止服务器多轨录音（录音时互相隔离）。
+pub const MAGIC_RECORD: [u8; 4] = *b"JTRC";
+/// 回放控制 magic, "JTPB"：开始/停止全员同步播放录制结果。
+pub const MAGIC_PLAYBACK: [u8; 4] = *b"JTPB";
+
+/// 控制命令：停止。
+pub const CMD_STOP: u8 = 0;
+/// 控制命令：开始。
+pub const CMD_START: u8 = 1;
+
+fn make_cmd(magic: [u8; 4], cmd: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5);
+    out.extend_from_slice(&magic);
+    out.push(cmd);
+    out
+}
+
+fn parse_cmd(buf: &[u8], magic: [u8; 4]) -> Option<u8> {
+    if buf.len() == 5 && buf[..4] == magic {
+        Some(buf[4])
+    } else {
+        None
+    }
+}
+
+pub fn make_music_cmd(cmd: u8) -> Vec<u8> {
+    make_cmd(MAGIC_MUSIC, cmd)
+}
+
+pub fn parse_music_cmd(buf: &[u8]) -> Option<u8> {
+    parse_cmd(buf, MAGIC_MUSIC)
+}
+
+pub fn make_record_cmd(cmd: u8) -> Vec<u8> {
+    make_cmd(MAGIC_RECORD, cmd)
+}
+
+pub fn parse_record_cmd(buf: &[u8]) -> Option<u8> {
+    parse_cmd(buf, MAGIC_RECORD)
+}
+
+pub fn make_playback_cmd(cmd: u8) -> Vec<u8> {
+    make_cmd(MAGIC_PLAYBACK, cmd)
+}
+
+pub fn parse_playback_cmd(buf: &[u8]) -> Option<u8> {
+    parse_cmd(buf, MAGIC_PLAYBACK)
+}
+
 /// Mix (saturating sum) multiple mono sample blocks into one.
 /// Blocks may differ in length; the output is as long as the longest block.
 /// This is the server-side mixing kernel.
@@ -276,5 +327,17 @@ mod tests {
 
         // Empty input → empty output.
         assert!(mix_blocks(&[]).is_empty());
+    }
+
+    #[test]
+    fn control_cmd_roundtrip() {
+        assert_eq!(parse_music_cmd(&make_music_cmd(CMD_START)), Some(CMD_START));
+        assert_eq!(parse_music_cmd(&make_music_cmd(CMD_STOP)), Some(CMD_STOP));
+        assert_eq!(parse_record_cmd(&make_record_cmd(CMD_START)), Some(CMD_START));
+        assert_eq!(parse_playback_cmd(&make_playback_cmd(CMD_STOP)), Some(CMD_STOP));
+        // 错误 magic / 缺命令字节
+        assert!(parse_music_cmd(b"XXXX").is_none());
+        assert!(parse_music_cmd(b"JTMU").is_none());
+        assert!(parse_record_cmd(b"JTMU\x01").is_none());
     }
 }

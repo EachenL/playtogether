@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use jt_core::{parse_ping, AudioBlock, Sample};
 
-use crate::hub::{ClientState, Hub};
+use crate::hub::{ClientState, Hub, MusicState, PlaybackState};
 
 /// A client is dropped if no packet arrives for this long.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -74,6 +74,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_room_clients,
         room_timeout: Duration::from_secs(room_timeout_secs),
         echo,
+        music: MusicState {
+            playing: false,
+            started_at: None,
+        },
+        recording: false,
+        recordings: HashMap::new(),
+        playback: PlaybackState {
+            playing: false,
+            started_at: None,
+        },
     };
     let mut plugins = plugins::all();
     let names: Vec<&str> = plugins.iter().map(|p| p.name()).collect();
@@ -145,38 +155,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hub.broadcast_roster(room);
         }
 
-        // 刷新该客户端的音频块 + 时间戳。
+        // 刷新该客户端的音频块 + 时间戳（保留原始音频用于多轨录音）。
+        let samples = block.samples;
         {
             let cs = hub.clients.get_mut(&src).unwrap();
-            cs.last_block = block.samples;
+            cs.last_block = samples.clone();
             cs.last_seen = Instant::now();
         }
+        let room = hub.clients.get(&src).unwrap().room;
 
-        // 为发送者混音（应用其 per-peer gain）。
-        let (room, gains) = {
-            let cs = hub.clients.get(&src).unwrap();
-            (cs.room, cs.gains.clone())
-        };
-        let mut mix: Vec<i32> = Vec::new();
-        for (addr, cs) in hub.clients.iter() {
-            if cs.room != room || (!hub.echo && *addr == src) {
-                continue;
-            }
-            let gain = gains.get(&cs.client_id).copied().unwrap_or(1.0);
-            for (j, &s) in cs.last_block.iter().enumerate() {
-                if j >= mix.len() {
-                    mix.push(0);
-                }
-                mix[j] += ((s as f32) * gain) as i32;
-            }
+        // 录音中：把该客户端的原始音频追加到它自己的轨道。
+        if hub.recording {
+            let cid = hub.clients.get(&src).unwrap().client_id;
+            hub.recordings
+                .entry(cid)
+                .or_default()
+                .extend_from_slice(&samples);
         }
 
-        if !mix.is_empty() {
-            let clamped: Vec<Sample> = mix
-                .iter()
-                .map(|&v| v.clamp(i16::MIN as i32, i16::MAX as i32) as Sample)
-                .collect();
-            let resp = AudioBlock::new(0, clamped);
+        let len = samples.len();
+
+        // 输出混音：回放 > 录音(隔离，只发音乐) > 正常(其他人 + 音乐)。
+        let output: Option<Vec<Sample>> = if hub.playback.playing {
+            Some(hub.playback_block(len))
+        } else if hub.recording {
+            Some(hub.synth_music_block(len))
+        } else {
+            let gains = hub.clients.get(&src).unwrap().gains.clone();
+            let mut mix: Vec<i32> = Vec::new();
+            for (addr, cs) in hub.clients.iter() {
+                if cs.room != room || (!hub.echo && *addr == src) {
+                    continue;
+                }
+                let gain = gains.get(&cs.client_id).copied().unwrap_or(1.0);
+                for (j, &s) in cs.last_block.iter().enumerate() {
+                    if j >= mix.len() {
+                        mix.push(0);
+                    }
+                    mix[j] += ((s as f32) * gain) as i32;
+                }
+            }
+            // 音乐混入（正常模式）。
+            if hub.music.playing {
+                let music = hub.synth_music_block(len);
+                for (j, &s) in music.iter().enumerate() {
+                    if j >= mix.len() {
+                        mix.push(0);
+                    }
+                    mix[j] += s as i32;
+                }
+            }
+            if mix.is_empty() {
+                None // 房间里只有自己且无音乐 → 不发
+            } else {
+                Some(
+                    mix.iter()
+                        .map(|&v| v.clamp(i16::MIN as i32, i16::MAX as i32) as Sample)
+                        .collect(),
+                )
+            }
+        };
+
+        if let Some(out_samples) = output {
+            let resp = AudioBlock::new(0, out_samples);
             let mut out = Vec::new();
             resp.serialize_into(room, &mut out);
             let _ = hub.socket.send_to(&out, src);

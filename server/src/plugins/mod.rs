@@ -10,6 +10,12 @@ pub mod roster;
 pub mod gain;
 #[cfg(feature = "room")]
 pub mod room;
+#[cfg(feature = "music")]
+pub mod music;
+#[cfg(feature = "recording")]
+pub mod recording;
+#[cfg(feature = "playback")]
+pub mod playback;
 
 use crate::plugin::Plugin;
 
@@ -23,6 +29,12 @@ pub fn all() -> Vec<Box<dyn Plugin>> {
     plugins.push(Box::new(gain::GainPlugin));
     #[cfg(feature = "room")]
     plugins.push(Box::new(room::RoomPlugin));
+    #[cfg(feature = "music")]
+    plugins.push(Box::new(music::MusicPlugin));
+    #[cfg(feature = "recording")]
+    plugins.push(Box::new(recording::RecordingPlugin));
+    #[cfg(feature = "playback")]
+    plugins.push(Box::new(playback::PlaybackPlugin));
     plugins
 }
 
@@ -37,5 +49,8 @@ mod tests {
         assert!(names.contains(&"roster"));
         assert!(names.contains(&"gain"));
         assert!(names.contains(&"room"));
+        assert!(names.contains(&"music"));
+        assert!(names.contains(&"recording"));
+        assert!(names.contains(&"playback"));
     }
 }
