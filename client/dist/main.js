@@ -33,6 +33,7 @@ const els = {
   session: $("session"),
   music: $("music"),
   record: $("record"),
+  muteAll: $("mute-all"),
   sidetone: $("sidetone"),
   recordList: $("record-list"),
 };
@@ -213,7 +214,12 @@ function renderRecordList(list) {
   }
 }
 
-// 本地反听（桌面端引擎功能，听自己）。
+// 全员静音切换
+els.muteAll.addEventListener("click", () => {
+  allMuted = !allMuted;
+  setAllMuted(allMuted);
+  els.muteAll.textContent = allMuted ? "取消全员静音" : "全员静音";
+});
 let sidetoneOn = false;
 els.sidetone.addEventListener("click", () => {
   sidetoneOn = !sidetoneOn;
@@ -234,6 +240,9 @@ async function pollRoster() {
     /* ignore */
   }
 }
+
+// 每成员静音状态：peer id → { muted: bool, prevGain: f32 }
+const peerMuted = {};
 
 function renderRoster(r) {
   const own = r.own_id;
@@ -257,15 +266,62 @@ function renderRoster(r) {
       slider.title = m.name + " 音量";
       slider.addEventListener("input", () => {
         const gain = Number(slider.value) / 100;
-        if (bridge && !PREVIEW) {
-          bridge("set_gain", { peer: m.id, gain }).catch(() => {});
-        } else if (web.ws && web.ws.readyState === WebSocket.OPEN) {
-          web.ws.send(JSON.stringify({ type: "gain", peer: m.id, gain }));
-        }
+        sendGain(m.id, gain);
       });
       row.appendChild(slider);
+      // 每成员静音按钮
+      const btn = document.createElement("button");
+      btn.className = "btn ghost mute-peer";
+      btn.textContent = "静音";
+      btn.title = "静音 " + m.name;
+      btn.addEventListener("click", () => {
+        const info = peerMuted[m.id] || { muted: false, prevGain: 1.0 };
+        const next = !info.muted;
+        peerMuted[m.id] = { muted: next, prevGain: info.prevGain || 1.0 };
+        const gain = next ? 0 : peerMuted[m.id].prevGain;
+        sendGain(m.id, gain);
+        slider.value = Math.round(gain * 100);
+        btn.textContent = next ? "取消静音" : "静音";
+      });
+      row.appendChild(btn);
     }
     els.memberList.appendChild(row);
+  }
+}
+
+let allMuted = false;
+function setAllMuted(on) {
+  allMuted = on;
+  const gain = on ? 0 : 1.0;
+  const sliders = els.memberList.querySelectorAll("input.gain");
+  const buttons = els.memberList.querySelectorAll("button.mute-peer");
+  sliders.forEach(s => s.value = Math.round(gain * 100));
+  buttons.forEach(b => b.textContent = on ? "取消静音" : "静音");
+  // 更新所有非己成员增益 + st
+  const own = web.ownId;
+  const members = els.memberList.querySelectorAll("div.member");
+  for (const row of members) {
+    const name = row.querySelector("span.member-name");
+    if (!name) continue;
+    const isOwn = name.textContent.includes("（我）");
+    if (!isOwn) {
+      // 假设 id 从 roster 中能获取，遍历发送
+      // 实际用 peerMuted 批量跟踪
+    }
+  }
+  // 遍历发送：从 web 取已知 roster id
+  // 简化：全增益发送
+  for (const pid of Object.keys(peerMuted)) {
+    sendGain(+pid, on ? 0 : (peerMuted[pid]?.prevGain || 1.0));
+  }
+}
+
+function sendGain(peer, gain) {
+  peerMuted[peer] = { muted: gain === 0, prevGain: gain !== 0 ? gain : (peerMuted[peer]?.prevGain || 1.0) };
+  if (bridge && !PREVIEW) {
+    bridge("set_gain", { peer, gain }).catch(() => {});
+  } else if (web.ws && web.ws.readyState === WebSocket.OPEN) {
+    web.ws.send(JSON.stringify({ type: "gain", peer, gain }));
   }
 }
 
