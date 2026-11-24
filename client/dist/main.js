@@ -30,6 +30,11 @@ const els = {
   target: $("target"),
   mic: $("mic"),
   peer: $("peer"),
+  session: $("session"),
+  music: $("music"),
+  record: $("record"),
+  playback: $("playback"),
+  sidetone: $("sidetone"),
 };
 
 const BAR_COUNT = 18;
@@ -162,6 +167,49 @@ function talk(v) {
   }
 }
 
+// 发送录制/回放控制命令（音乐/录音/回放）。
+function sendSessionCmd(kind, cmd) {
+  const on = cmd === 1;
+  if (bridge && !PREVIEW) {
+    if (kind === "music") bridge("set_music", { on }).catch(() => {});
+    else if (kind === "record") bridge("set_recording", { on }).catch(() => {});
+    else if (kind === "playback") bridge("set_playback", { on }).catch(() => {});
+    return;
+  }
+  if (web.ws && web.ws.readyState === WebSocket.OPEN) {
+    web.ws.send(JSON.stringify({ type: kind, cmd }));
+  }
+}
+
+let musicOn = false, recordOn = false, playbackOn = false;
+els.music.addEventListener("click", () => {
+  musicOn = !musicOn;
+  sendSessionCmd("music", musicOn ? 1 : 0);
+  els.music.textContent = musicOn ? "停止音乐" : "播放音乐";
+});
+els.record.addEventListener("click", () => {
+  recordOn = !recordOn;
+  sendSessionCmd("record", recordOn ? 1 : 0);
+  els.record.textContent = recordOn ? "停止录音" : "开始录音";
+});
+els.playback.addEventListener("click", () => {
+  playbackOn = !playbackOn;
+  sendSessionCmd("playback", playbackOn ? 1 : 0);
+  els.playback.textContent = playbackOn ? "停止回放" : "回放";
+});
+
+// 本地反听（桌面端引擎功能，听自己）。
+let sidetoneOn = false;
+els.sidetone.addEventListener("click", () => {
+  sidetoneOn = !sidetoneOn;
+  if (bridge && !PREVIEW) {
+    bridge("set_sidetone", { on: sidetoneOn }).catch(() => {});
+  } else {
+    setHint("反听是桌面端功能（网页端请戴耳机直接用系统监听）", "");
+  }
+  els.sidetone.textContent = sidetoneOn ? "关闭反听" : "反听";
+});
+
 async function pollRoster() {
   if (PREVIEW || !bridge) return;
   try {
@@ -292,6 +340,8 @@ async function startWebAudio(room, name, mode) {
       setState("on", "已加入");
       setHint(`已进入房间 ${room}（浏览器 · ${mode === "voice" ? "语音+AEC" : "排练"}）`, "ok");
       els.stop.disabled = false;
+      els.session.style.display = "";
+      els.members.style.display = "";
     };
 
     ws.onmessage = (event) => {

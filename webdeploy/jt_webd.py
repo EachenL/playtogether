@@ -42,6 +42,9 @@ NAME_MAGIC = b"JTNM"
 GAIN_MAGIC = b"JTGN"
 WELCOME_MAGIC = b"JTWC"
 ROSTER_MAGIC = b"JTRS"
+MUSIC_MAGIC = b"JTMU"
+RECORD_MAGIC = b"JTRC"
+PLAYBACK_MAGIC = b"JTPB"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -142,6 +145,17 @@ class Session:
                         await self.loop.sock_sendto(
                             self.sock, GAIN_MAGIC + struct.pack("<If", peer, gain), SERVER_ADDR
                         )
+                    except (ValueError, TypeError, OSError):
+                        pass
+                elif t in ("music", "record", "playback"):
+                    magic = {
+                        "music": MUSIC_MAGIC,
+                        "record": RECORD_MAGIC,
+                        "playback": PLAYBACK_MAGIC,
+                    }[t]
+                    try:
+                        cmd = int(data.get("cmd", 0)) & 0xFF
+                        await self.loop.sock_sendto(self.sock, magic + bytes([cmd]), SERVER_ADDR)
                     except (ValueError, TypeError, OSError):
                         pass
 

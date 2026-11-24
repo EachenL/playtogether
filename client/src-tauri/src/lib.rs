@@ -21,6 +21,10 @@ enum Cmd {
     SetTalking(bool),
     SetName(String),
     SetGain(u32, f32),
+    SetSidetone(bool),
+    SetMusic(bool),
+    SetRecording(bool),
+    SetPlayback(bool),
     Roster(Sender<serde_json::Value>),
 }
 
@@ -65,6 +69,26 @@ fn engine_loop(rx: mpsc::Receiver<Cmd>) {
             Cmd::SetGain(peer, gain) => {
                 if let Some(s) = &session {
                     s.set_gain(peer, gain);
+                }
+            }
+            Cmd::SetSidetone(on) => {
+                if let Some(s) = &session {
+                    s.set_sidetone(on);
+                }
+            }
+            Cmd::SetMusic(on) => {
+                if let Some(s) = &session {
+                    s.set_music(on);
+                }
+            }
+            Cmd::SetRecording(on) => {
+                if let Some(s) = &session {
+                    s.set_recording(on);
+                }
+            }
+            Cmd::SetPlayback(on) => {
+                if let Some(s) = &session {
+                    s.set_playback(on);
                 }
             }
             Cmd::Roster(resp) => {
@@ -222,6 +246,30 @@ fn set_gain(peer: u32, gain: f32) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// 本地反听开关（听自己）。
+#[tauri::command]
+fn set_sidetone(on: bool) -> Result<(), String> {
+    cmd_tx().send(Cmd::SetSidetone(on)).map_err(|e| e.to_string())
+}
+
+/// 同步播放/停止内置伴奏。
+#[tauri::command]
+fn set_music(on: bool) -> Result<(), String> {
+    cmd_tx().send(Cmd::SetMusic(on)).map_err(|e| e.to_string())
+}
+
+/// 开始/停止服务器多轨录音。
+#[tauri::command]
+fn set_recording(on: bool) -> Result<(), String> {
+    cmd_tx().send(Cmd::SetRecording(on)).map_err(|e| e.to_string())
+}
+
+/// 开始/停止全员同步回放。
+#[tauri::command]
+fn set_playback(on: bool) -> Result<(), String> {
+    cmd_tx().send(Cmd::SetPlayback(on)).map_err(|e| e.to_string())
+}
+
 /// Fetch the current room roster (own id + member id/name list).
 #[tauri::command]
 fn get_roster() -> Result<serde_json::Value, String> {
@@ -243,7 +291,11 @@ pub fn run() {
             set_talking,
             set_name,
             set_gain,
-            get_roster
+            get_roster,
+            set_sidetone,
+            set_music,
+            set_recording,
+            set_playback
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

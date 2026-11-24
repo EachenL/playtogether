@@ -268,6 +268,7 @@ pub struct ClientSession {
     sample_rate: f64,
     buffer_frames: f64,
     talking: Arc<AtomicBool>,
+    sidetone_on: Arc<AtomicBool>,
     own_id: Arc<AtomicU32>,
     roster: Arc<Mutex<Vec<(u32, String)>>>,
 }
@@ -307,6 +308,9 @@ impl ClientSession {
         let room_id = config.room_id;
         let own_id = Arc::new(AtomicU32::new(0));
         let roster = Arc::new(Mutex::new(Vec::<(u32, String)>::new()));
+        // 本地反听：把采集缓冲起来，混入本地输出（录音时听自己）。
+        let sidetone: Arc<Mutex<VecDeque<Sample>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let sidetone_on = Arc::new(AtomicBool::new(false));
 
         // Latency model inputs: sample rate and per-stream buffer size.
         let sample_rate = in_cfg.sample_rate().0 as f64;
@@ -388,10 +392,18 @@ impl ClientSession {
         });
 
         // --- input stream (mic -> channel) ---
-        let input_stream = build_input_stream(&in_dev, &in_cfg, tx.clone(), aec.clone())?;
+        let input_stream = build_input_stream(
+            &in_dev,
+            &in_cfg,
+            tx.clone(),
+            aec.clone(),
+            sidetone.clone(),
+            sidetone_on.clone(),
+        )?;
 
         // --- output stream (jitter buffer -> speaker) ---
-        let output_stream = build_output_stream(&out_dev, &out_cfg, fifo.clone(), aec.clone())?;
+        let output_stream =
+            build_output_stream(&out_dev, &out_cfg, fifo.clone(), sidetone.clone(), aec.clone())?;
 
         input_stream.play()?;
         output_stream.play()?;
@@ -407,6 +419,7 @@ impl ClientSession {
             sample_rate,
             buffer_frames,
             talking,
+            sidetone_on,
             own_id,
             roster,
         })
@@ -456,6 +469,29 @@ impl ClientSession {
         let _ = self.socket.send(&jt_core::make_gain(peer_id, gain));
     }
 
+    /// 本地反听：是否把麦克风采集混入本地输出（听自己）。默认关，录音时开（用耳机）。
+    pub fn set_sidetone(&self, on: bool) {
+        self.sidetone_on.store(on, Ordering::Relaxed);
+    }
+
+    /// 同步播放/停止内置伴奏（服务器）。
+    pub fn set_music(&self, on: bool) {
+        let cmd = if on { jt_core::CMD_START } else { jt_core::CMD_STOP };
+        let _ = self.socket.send(&jt_core::make_music_cmd(cmd));
+    }
+
+    /// 开始/停止服务器多轨录音（录音时互相隔离）。
+    pub fn set_recording(&self, on: bool) {
+        let cmd = if on { jt_core::CMD_START } else { jt_core::CMD_STOP };
+        let _ = self.socket.send(&jt_core::make_record_cmd(cmd));
+    }
+
+    /// 开始/停止全员同步回放录制结果。
+    pub fn set_playback(&self, on: bool) {
+        let cmd = if on { jt_core::CMD_START } else { jt_core::CMD_STOP };
+        let _ = self.socket.send(&jt_core::make_playback_cmd(cmd));
+    }
+
     /// This client's server-assigned id (0 until the welcome arrives).
     pub fn own_id(&self) -> u32 {
         self.own_id.load(Ordering::Relaxed)
@@ -487,12 +523,16 @@ fn build_input_stream(
     cfg: &cpal::SupportedStreamConfig,
     tx: SyncSender<Vec<Sample>>,
     aec: Option<Arc<Mutex<AecState>>>,
+    sidetone: Arc<Mutex<VecDeque<Sample>>>,
+    sidetone_on: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     let channels = cfg.channels() as usize;
     let config = cfg.config();
     let stream = match cfg.sample_format() {
         cpal::SampleFormat::I16 => {
             let a = aec.clone();
+            let s = sidetone.clone();
+            let so = sidetone_on.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[i16], _| {
@@ -501,6 +541,7 @@ fn build_input_stream(
                         Some(aec) => aec.lock().unwrap().process_capture(&mono),
                         None => mono,
                     };
+                    push_sidetone(&s, &so, &out);
                     let _ = tx.try_send(out);
                 },
                 err_fn,
@@ -509,6 +550,8 @@ fn build_input_stream(
         }
         cpal::SampleFormat::U16 => {
             let a = aec.clone();
+            let s = sidetone.clone();
+            let so = sidetone_on.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[u16], _| {
@@ -517,6 +560,7 @@ fn build_input_stream(
                         Some(aec) => aec.lock().unwrap().process_capture(&mono),
                         None => mono,
                     };
+                    push_sidetone(&s, &so, &out);
                     let _ = tx.try_send(out);
                 },
                 err_fn,
@@ -525,6 +569,8 @@ fn build_input_stream(
         }
         cpal::SampleFormat::F32 => {
             let a = aec.clone();
+            let s = sidetone.clone();
+            let so = sidetone_on.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[f32], _| {
@@ -533,6 +579,7 @@ fn build_input_stream(
                         Some(aec) => aec.lock().unwrap().process_capture(&mono),
                         None => mono,
                     };
+                    push_sidetone(&s, &so, &out);
                     let _ = tx.try_send(out);
                 },
                 err_fn,
@@ -548,6 +595,7 @@ fn build_output_stream(
     device: &cpal::Device,
     cfg: &cpal::SupportedStreamConfig,
     fifo: SampleFifo,
+    sidetone: Arc<Mutex<VecDeque<Sample>>>,
     aec: Option<Arc<Mutex<AecState>>>,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     let channels = cfg.channels() as usize;
@@ -555,30 +603,33 @@ fn build_output_stream(
     let stream = match cfg.sample_format() {
         cpal::SampleFormat::I16 => {
             let f = fifo.clone();
+            let s = sidetone.clone();
             let a = aec.clone();
             device.build_output_stream(
                 &config,
-                move |data: &mut [i16], _| write_i16(data, channels, &f, a.as_deref()),
+                move |data: &mut [i16], _| write_i16(data, channels, &f, Some(s.as_ref()), a.as_deref()),
                 err_fn,
                 None,
             )?
         }
         cpal::SampleFormat::U16 => {
             let f = fifo.clone();
+            let s = sidetone.clone();
             let a = aec.clone();
             device.build_output_stream(
                 &config,
-                move |data: &mut [u16], _| write_u16(data, channels, &f, a.as_deref()),
+                move |data: &mut [u16], _| write_u16(data, channels, &f, Some(s.as_ref()), a.as_deref()),
                 err_fn,
                 None,
             )?
         }
         cpal::SampleFormat::F32 => {
             let f = fifo.clone();
+            let s = sidetone.clone();
             let a = aec.clone();
             device.build_output_stream(
                 &config,
-                move |data: &mut [f32], _| write_f32(data, channels, &f, a.as_deref()),
+                move |data: &mut [f32], _| write_f32(data, channels, &f, Some(s.as_ref()), a.as_deref()),
                 err_fn,
                 None,
             )?
@@ -621,11 +672,45 @@ fn mono_i16_from_f32(data: &[f32], channels: usize) -> Vec<Sample> {
         .collect()
 }
 
-fn write_i16(data: &mut [i16], channels: usize, fifo: &SampleFifo, aec: Option<&Mutex<AecState>>) {
+/// 本地反听缓冲上限（1 秒 @ 48kHz）。
+const SIDETONE_CAP: usize = 48_000;
+/// 反听增益（听自己时的音量，避免太响盖过伴奏）。
+const SIDETONE_GAIN: f32 = 0.5;
+
+/// 把采集样本推入反听缓冲（若开启）。有界，防止积压。
+fn push_sidetone(sidetone: &Mutex<VecDeque<Sample>>, on: &AtomicBool, samples: &[Sample]) {
+    if !on.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut buf = sidetone.lock().unwrap();
+    buf.extend(samples.iter().copied());
+    while buf.len() > SIDETONE_CAP {
+        buf.pop_front();
+    }
+}
+
+/// 混音：服务器混音 + 本地反听（听自己）。
+fn mix_sidetone(server: Sample, sidetone: Option<&Mutex<VecDeque<Sample>>>) -> Sample {
+    let self_mon = sidetone
+        .map(|s| {
+            let v = s.lock().unwrap().pop_front().unwrap_or(0);
+            (v as f32 * SIDETONE_GAIN) as Sample
+        })
+        .unwrap_or(0);
+    (server as i32 + self_mon as i32).clamp(i16::MIN as i32, i16::MAX as i32) as Sample
+}
+
+fn write_i16(
+    data: &mut [i16],
+    channels: usize,
+    fifo: &SampleFifo,
+    sidetone: Option<&Mutex<VecDeque<Sample>>>,
+    aec: Option<&Mutex<AecState>>,
+) {
     let n = data.len() / channels;
     let mut mono = Vec::with_capacity(n);
     for _ in 0..n {
-        mono.push(fifo.pop());
+        mono.push(mix_sidetone(fifo.pop(), sidetone));
     }
     if let Some(a) = aec {
         a.lock().unwrap().push_render(&mono);
@@ -637,11 +722,17 @@ fn write_i16(data: &mut [i16], channels: usize, fifo: &SampleFifo, aec: Option<&
     }
 }
 
-fn write_u16(data: &mut [u16], channels: usize, fifo: &SampleFifo, aec: Option<&Mutex<AecState>>) {
+fn write_u16(
+    data: &mut [u16],
+    channels: usize,
+    fifo: &SampleFifo,
+    sidetone: Option<&Mutex<VecDeque<Sample>>>,
+    aec: Option<&Mutex<AecState>>,
+) {
     let n = data.len() / channels;
     let mut mono = Vec::with_capacity(n);
     for _ in 0..n {
-        mono.push(fifo.pop());
+        mono.push(mix_sidetone(fifo.pop(), sidetone));
     }
     if let Some(a) = aec {
         a.lock().unwrap().push_render(&mono);
@@ -654,11 +745,17 @@ fn write_u16(data: &mut [u16], channels: usize, fifo: &SampleFifo, aec: Option<&
     }
 }
 
-fn write_f32(data: &mut [f32], channels: usize, fifo: &SampleFifo, aec: Option<&Mutex<AecState>>) {
+fn write_f32(
+    data: &mut [f32],
+    channels: usize,
+    fifo: &SampleFifo,
+    sidetone: Option<&Mutex<VecDeque<Sample>>>,
+    aec: Option<&Mutex<AecState>>,
+) {
     let n = data.len() / channels;
     let mut mono = Vec::with_capacity(n);
     for _ in 0..n {
-        mono.push(fifo.pop());
+        mono.push(mix_sidetone(fifo.pop(), sidetone));
     }
     if let Some(a) = aec {
         a.lock().unwrap().push_render(&mono);
