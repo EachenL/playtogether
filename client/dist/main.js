@@ -33,8 +33,8 @@ const els = {
   session: $("session"),
   music: $("music"),
   record: $("record"),
-  playback: $("playback"),
   sidetone: $("sidetone"),
+  recordList: $("record-list"),
 };
 
 const BAR_COUNT = 18;
@@ -167,21 +167,21 @@ function talk(v) {
   }
 }
 
-// 发送录制/回放控制命令（音乐/录音/回放）。
-function sendSessionCmd(kind, cmd) {
+// 录制/回放控制命令
+function sendSessionCmd(kind, cmd, rid) {
   const on = cmd === 1;
   if (bridge && !PREVIEW) {
     if (kind === "music") bridge("set_music", { on }).catch(() => {});
     else if (kind === "record") bridge("set_recording", { on }).catch(() => {});
-    else if (kind === "playback") bridge("set_playback", { on }).catch(() => {});
+    else if (kind === "playback") bridge("set_playback", { rid: rid || 0, on }).catch(() => {});
     return;
   }
   if (web.ws && web.ws.readyState === WebSocket.OPEN) {
-    web.ws.send(JSON.stringify({ type: kind, cmd }));
+    web.ws.send(JSON.stringify({ type: kind, cmd, rid: rid || 0 }));
   }
 }
 
-let musicOn = false, recordOn = false, playbackOn = false;
+let musicOn = false, recordOn = false;
 els.music.addEventListener("click", () => {
   musicOn = !musicOn;
   sendSessionCmd("music", musicOn ? 1 : 0);
@@ -192,11 +192,26 @@ els.record.addEventListener("click", () => {
   sendSessionCmd("record", recordOn ? 1 : 0);
   els.record.textContent = recordOn ? "停止录音" : "开始录音";
 });
-els.playback.addEventListener("click", () => {
-  playbackOn = !playbackOn;
-  sendSessionCmd("playback", playbackOn ? 1 : 0);
-  els.playback.textContent = playbackOn ? "停止回放" : "回放";
-});
+
+// 处理历史录制列表
+function renderRecordList(list) {
+  if (!els.recordList) return;
+  els.recordList.innerHTML = "";
+  for (const [rid, durMs] of list) {
+    const dur = (durMs / 1000).toFixed(1) + "s";
+    const row = document.createElement("div");
+    row.className = "record-row";
+    row.innerHTML = `<span>录制 #${rid} (${dur})</span>`;
+    const btn = document.createElement("button");
+    btn.className = "btn ghost";
+    btn.textContent = "回放";
+    btn.addEventListener("click", () => {
+      sendSessionCmd("playback", 1, rid);
+    });
+    row.appendChild(btn);
+    els.recordList.appendChild(row);
+  }
+}
 
 // 本地反听（桌面端引擎功能，听自己）。
 let sidetoneOn = false;
@@ -351,6 +366,8 @@ async function startWebAudio(room, name, mode) {
           if (msg.type === "pong" && typeof msg.ts === "number") {
             web.rttMs = performance.now() - msg.ts;
             paintMetrics({ rtt: web.rttMs, oneWay: web.rttMs / 2 + FRAME_SAMPLES / 48 + 60 });
+          } else if (msg.type === "record_list") {
+            renderRecordList(msg.list || []);
           } else if (msg.type === "welcome") {
             web.ownId = msg.id;
           } else if (msg.type === "roster") {

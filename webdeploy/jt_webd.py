@@ -45,6 +45,7 @@ ROSTER_MAGIC = b"JTRS"
 MUSIC_MAGIC = b"JTMU"
 RECORD_MAGIC = b"JTRC"
 PLAYBACK_MAGIC = b"JTPB"
+RECORD_LIST_MAGIC = b"JTRL"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -148,16 +149,24 @@ class Session:
                     except (ValueError, TypeError, OSError):
                         pass
                 elif t in ("music", "record", "playback"):
-                    magic = {
-                        "music": MUSIC_MAGIC,
-                        "record": RECORD_MAGIC,
-                        "playback": PLAYBACK_MAGIC,
-                    }[t]
-                    try:
-                        cmd = int(data.get("cmd", 0)) & 0xFF
-                        await self.loop.sock_sendto(self.sock, magic + bytes([cmd]), SERVER_ADDR)
-                    except (ValueError, TypeError, OSError):
-                        pass
+                    if t == "playback":
+                        magic = PLAYBACK_MAGIC
+                        try:
+                            rid = int(data.get("rid", 0)) & 0xFFFFFFFF
+                            cmd = int(data.get("cmd", 0)) & 0xFF
+                            await self.loop.sock_sendto(self.sock, magic + struct.pack("<IB", rid, cmd), SERVER_ADDR)
+                        except (ValueError, TypeError, OSError):
+                            pass
+                    else:
+                        magic = {
+                            "music": MUSIC_MAGIC,
+                            "record": RECORD_MAGIC,
+                        }[t]
+                        try:
+                            cmd = int(data.get("cmd", 0)) & 0xFF
+                            await self.loop.sock_sendto(self.sock, magic + bytes([cmd]), SERVER_ADDR)
+                        except (ValueError, TypeError, OSError):
+                            pass
 
     async def pump_udp(self) -> None:
         """服务器 → 浏览器。"""
@@ -178,6 +187,23 @@ class Session:
                 cid = struct.unpack("<I", data[4:8])[0]
                 try:
                     await self.ws.send(json.dumps({"type": "welcome", "id": cid}))
+                except Exception:
+                    return
+                continue
+
+            if data[:4] == RECORD_LIST_MAGIC and len(data) >= 6:
+                count = struct.unpack("<H", data[4:6])[0]
+                items = []
+                pos = 6
+                for _ in range(count):
+                    if pos + 8 > len(data):
+                        break
+                    rid = struct.unpack("<I", data[pos:pos + 4])[0]
+                    dur_ms = struct.unpack("<I", data[pos + 4:pos + 8])[0]
+                    pos += 8
+                    items.append([rid, dur_ms])
+                try:
+                    await self.ws.send(json.dumps({"type": "record_list", "list": items}))
                 except Exception:
                     return
                 continue

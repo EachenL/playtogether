@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use jt_core::{
-    make_music_cmd, make_ping, make_playback_cmd, make_record_cmd, parse_ping, parse_room_full,
-    AudioBlock, CMD_START, CMD_STOP,
+    make_music_cmd, make_ping, make_playback_cmd, make_record_cmd, parse_ping,
+    parse_playback_cmd, parse_room_full, AudioBlock, CMD_START, CMD_STOP,
 };
 
 /// Kills the server child on drop, even if a test panics.
@@ -198,17 +198,18 @@ fn server_plays_music_records_and_plays_back() {
     assert!(music.iter().any(|&s| s != 0), "音乐应非静音");
     sock.send(&make_music_cmd(CMD_STOP)).expect("music stop");
 
-    // 开始录音 → 录一段非静音 tone。
+    // 开始录音 → 录一段非静音 tone。录音不隔离，正常混音。
     sock.send(&make_record_cmd(CMD_START)).expect("record start");
     let tone: Vec<i16> = (0..480)
         .map(|i| ((i as f32 / 8.0).sin() * 10000.0) as i16)
         .collect();
     send_block(&sock, 1234, &tone);
-    let _ = recv_audio(&sock); // 录音模式的响应是静音/音乐，忽略
+    let _ = recv_audio(&sock);
     sock.send(&make_record_cmd(CMD_STOP)).expect("record stop");
 
-    // 回放 → 应收到录制的 tone（非静音）。
-    sock.send(&make_playback_cmd(CMD_START)).expect("playback start");
+    // 回放指定录制 → 应收到录制的 tone（非静音）。
+    let playback_pkt = make_playback_cmd(1, CMD_START);
+    sock.send(&playback_pkt).expect("playback start");
     send_block(&sock, 1234, &vec![0i16; 480]);
     let played = recv_block(&sock);
     assert!(played.iter().any(|&s| s != 0), "回放应非静音（录制的内容）");

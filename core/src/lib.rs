@@ -252,12 +252,54 @@ pub fn parse_record_cmd(buf: &[u8]) -> Option<u8> {
     parse_cmd(buf, MAGIC_RECORD)
 }
 
-pub fn make_playback_cmd(cmd: u8) -> Vec<u8> {
-    make_cmd(MAGIC_PLAYBACK, cmd)
+pub fn make_playback_cmd(recording_id: u32, cmd: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9);
+    out.extend_from_slice(&MAGIC_PLAYBACK);
+    out.extend_from_slice(&recording_id.to_le_bytes());
+    out.push(cmd);
+    out
 }
 
-pub fn parse_playback_cmd(buf: &[u8]) -> Option<u8> {
-    parse_cmd(buf, MAGIC_PLAYBACK)
+pub fn parse_playback_cmd(buf: &[u8]) -> Option<(u32, u8)> {
+    if buf.len() == 9 && buf[..4] == MAGIC_PLAYBACK {
+        let id = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        Some((id, buf[8]))
+    } else {
+        None
+    }
+}
+
+/// 录制列表 magic, "JTRL"：服务器广播历史录制（id + 时长毫秒）。
+pub const MAGIC_RECORD_LIST: [u8; 4] = *b"JTRL";
+
+pub fn make_record_list(entries: &[(u32, u32)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&MAGIC_RECORD_LIST);
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for (id, dur_ms) in entries {
+        out.extend_from_slice(&id.to_le_bytes());
+        out.extend_from_slice(&dur_ms.to_le_bytes());
+    }
+    out
+}
+
+pub fn parse_record_list(buf: &[u8]) -> Option<Vec<(u32, u32)>> {
+    if buf.len() < 6 || buf[..4] != MAGIC_RECORD_LIST {
+        return None;
+    }
+    let count = u16::from_le_bytes(buf[4..6].try_into().ok()?) as usize;
+    let mut entries = Vec::with_capacity(count);
+    let mut pos = 6;
+    for _ in 0..count {
+        if pos + 8 > buf.len() {
+            return None;
+        }
+        let id = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?);
+        let dur_ms = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().ok()?);
+        pos += 8;
+        entries.push((id, dur_ms));
+    }
+    Some(entries)
 }
 
 /// Mix (saturating sum) multiple mono sample blocks into one.
@@ -334,7 +376,10 @@ mod tests {
         assert_eq!(parse_music_cmd(&make_music_cmd(CMD_START)), Some(CMD_START));
         assert_eq!(parse_music_cmd(&make_music_cmd(CMD_STOP)), Some(CMD_STOP));
         assert_eq!(parse_record_cmd(&make_record_cmd(CMD_START)), Some(CMD_START));
-        assert_eq!(parse_playback_cmd(&make_playback_cmd(CMD_STOP)), Some(CMD_STOP));
+        assert_eq!(parse_playback_cmd(&make_playback_cmd(7, CMD_STOP)), Some((7, CMD_STOP)));
+        // 录制列表往返
+        let list = vec![(1, 1000), (2, 2500)];
+        assert_eq!(parse_record_list(&make_record_list(&list)), Some(list));
         // 错误 magic / 缺命令字节
         assert!(parse_music_cmd(b"XXXX").is_none());
         assert!(parse_music_cmd(b"JTMU").is_none());

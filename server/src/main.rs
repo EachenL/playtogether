@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use jt_core::{parse_ping, AudioBlock, Sample};
 
-use crate::hub::{ClientState, Hub, MusicState, PlaybackState};
+use crate::hub::{ClientState, Hub, MusicState};
 
 /// A client is dropped if no packet arrives for this long.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -79,11 +79,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             started_at: None,
         },
         recording: false,
-        recordings: HashMap::new(),
-        playback: PlaybackState {
-            playing: false,
-            started_at: None,
-        },
+        active_recording: None,
+        recordings: Vec::new(),
+        next_recording_id: 1,
+        playback: None,
     };
     let mut plugins = plugins::all();
     let names: Vec<&str> = plugins.iter().map(|p| p.name()).collect();
@@ -164,22 +163,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let room = hub.clients.get(&src).unwrap().room;
 
-        // 录音中：把该客户端的原始音频追加到它自己的轨道。
+        // 录音中：把该客户端的原始音频追加到当前录制的轨道（不改变混音）。
         if hub.recording {
             let cid = hub.clients.get(&src).unwrap().client_id;
-            hub.recordings
-                .entry(cid)
-                .or_default()
-                .extend_from_slice(&samples);
+            if let Some(rec) = hub.active_recording.as_mut() {
+                rec.tracks.entry(cid).or_default().extend_from_slice(&samples);
+            }
         }
 
         let len = samples.len();
 
-        // 输出混音：回放 > 录音(隔离，只发音乐) > 正常(其他人 + 音乐)。
-        let output: Option<Vec<Sample>> = if hub.playback.playing {
-            Some(hub.playback_block(len))
-        } else if hub.recording {
-            Some(hub.synth_music_block(len))
+        // 输出混音：回放 > 正常（其他人 + 音乐）。录音不影响混音。
+        let playback_id = hub.playback.as_ref().map(|p| p.recording_id);
+        let output: Option<Vec<Sample>> = if let Some(id) = playback_id {
+            Some(hub.playback_block(id, len))
         } else {
             let gains = hub.clients.get(&src).unwrap().gains.clone();
             let mut mix: Vec<i32> = Vec::new();
@@ -195,7 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mix[j] += ((s as f32) * gain) as i32;
                 }
             }
-            // 音乐混入（正常模式）。
+            // 音乐混入。
             if hub.music.playing {
                 let music = hub.synth_music_block(len);
                 for (j, &s) in music.iter().enumerate() {

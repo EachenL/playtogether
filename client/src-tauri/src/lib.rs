@@ -24,7 +24,7 @@ enum Cmd {
     SetSidetone(bool),
     SetMusic(bool),
     SetRecording(bool),
-    SetPlayback(bool),
+    SetPlayback(u32, bool),
     Roster(Sender<serde_json::Value>),
 }
 
@@ -86,9 +86,9 @@ fn engine_loop(rx: mpsc::Receiver<Cmd>) {
                     s.set_recording(on);
                 }
             }
-            Cmd::SetPlayback(on) => {
+            Cmd::SetPlayback(rid, on) => {
                 if let Some(s) = &session {
-                    s.set_playback(on);
+                    s.set_playback(rid, on);
                 }
             }
             Cmd::Roster(resp) => {
@@ -264,10 +264,10 @@ fn set_recording(on: bool) -> Result<(), String> {
     cmd_tx().send(Cmd::SetRecording(on)).map_err(|e| e.to_string())
 }
 
-/// 开始/停止全员同步回放。
+/// 开始/停止回放指定历史录制（rid: 录制编号 1/2/…）。
 #[tauri::command]
-fn set_playback(on: bool) -> Result<(), String> {
-    cmd_tx().send(Cmd::SetPlayback(on)).map_err(|e| e.to_string())
+fn set_playback(rid: u32, on: bool) -> Result<(), String> {
+    cmd_tx().send(Cmd::SetPlayback(rid, on)).map_err(|e| e.to_string())
 }
 
 /// Fetch the current room roster (own id + member id/name list).

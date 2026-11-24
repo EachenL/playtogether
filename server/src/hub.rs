@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 use jt_core::{Sample, SAMPLE_RATE_HZ};
 
+/// 历史录制最多保留的条数。
+pub const MAX_RECORDINGS: usize = 20;
+
 /// 单个客户端的状态。
 pub struct ClientState {
     pub room: u32,
@@ -28,10 +31,17 @@ pub struct MusicState {
     pub started_at: Option<Instant>,
 }
 
-/// 录制结果回放的状态。
+/// 回放某条历史录制的状态。
 pub struct PlaybackState {
-    pub playing: bool,
-    pub started_at: Option<Instant>,
+    pub recording_id: u32,
+    pub started_at: Instant,
+}
+
+/// 一条历史录制（多轨：每个客户端一轨）。
+pub struct Recording {
+    pub id: u32,
+    pub duration_samples: usize,
+    pub tracks: HashMap<u32, Vec<Sample>>,
 }
 
 /// 服务器核心：socket + 客户端/房间状态 + 混音 + 录音/音乐/回放所需的一切。
@@ -45,10 +55,15 @@ pub struct Hub {
     pub echo: bool,
 
     pub music: MusicState,
+    /// 是否正在录音（独立的开关，与音乐播放无关）。
     pub recording: bool,
-    /// 多轨录音：client_id → 该客户端录制的全部样本。
-    pub recordings: HashMap<u32, Vec<Sample>>,
-    pub playback: PlaybackState,
+    /// 正在录制的会话（录音中才有值）。
+    pub active_recording: Option<Recording>,
+    /// 历史录制（最多 [`MAX_RECORDINGS`] 条）。
+    pub recordings: Vec<Recording>,
+    pub next_recording_id: u32,
+    /// 当前回放（None = 未在回放）。
+    pub playback: Option<PlaybackState>,
 }
 
 impl Hub {
@@ -74,6 +89,22 @@ impl Hub {
         self.clients.values().filter(|cs| cs.room == room).count()
     }
 
+    /// 广播历史录制列表（id + 时长）给所有客户端。
+    pub fn broadcast_record_list(&self) {
+        let entries: Vec<(u32, u32)> = self
+            .recordings
+            .iter()
+            .map(|r| {
+                let dur_ms = (r.duration_samples as f64 / SAMPLE_RATE_HZ as f64 * 1000.0) as u32;
+                (r.id, dur_ms)
+            })
+            .collect();
+        let pkt = jt_core::make_record_list(&entries);
+        for addr in self.clients.keys() {
+            let _ = self.socket.send_to(&pkt, *addr);
+        }
+    }
+
     /// 音乐开始后经过的时长。
     fn music_offset(&self) -> Duration {
         self.music
@@ -83,7 +114,6 @@ impl Hub {
     }
 
     /// 生成当前音乐块：一个节拍器（120 BPM）+ 一个 A 大调和弦垫。
-    /// `len` 为采样数（一帧 480 = 10ms）。全房间同步：都以服务器时钟为基准。
     pub fn synth_music_block(&self, len: usize) -> Vec<Sample> {
         if !self.music.playing {
             return vec![0; len];
@@ -94,14 +124,12 @@ impl Hub {
         let mut out = Vec::with_capacity(len);
         for i in 0..len {
             let t = offset + i as f64 / sr;
-            // 节拍器咔哒声
             let beat_pos = (t / beat_period).fract();
             let click = if beat_pos < 0.02 {
                 (1.0 - beat_pos / 0.02) * 0.7
             } else {
                 0.0
             };
-            // A 大调和弦（A4=440, C#5=554, E5=659）
             let pad = 0.06 * (2.0 * PI * 440.0 * t).sin()
                 + 0.06 * (2.0 * PI * 554.0 * t).sin()
                 + 0.06 * (2.0 * PI * 659.0 * t).sin();
@@ -111,18 +139,20 @@ impl Hub {
         out
     }
 
-    /// 生成当前回放块：把所有录制轨道按时间对齐混音。
-    /// `len` 为采样数。轨道长度不同时，取到哪算哪。
-    pub fn playback_block(&self, len: usize) -> Vec<Sample> {
+    /// 生成某条历史录制的当前回放块（混音所有轨道，按时间对齐）。
+    pub fn playback_block(&self, recording_id: u32, len: usize) -> Vec<Sample> {
+        let Some(rec) = self.recordings.iter().find(|r| r.id == recording_id) else {
+            return vec![0; len];
+        };
         let sr = SAMPLE_RATE_HZ as f64;
         let idx0 = (self
             .playback
-            .started_at
-            .map(|t| t.elapsed().as_secs_f64())
+            .as_ref()
+            .map(|p| p.started_at.elapsed().as_secs_f64())
             .unwrap_or_default()
             * sr) as usize;
         let mut mix: Vec<i32> = vec![0; len];
-        for track in self.recordings.values() {
+        for track in rec.tracks.values() {
             for (i, m) in mix.iter_mut().enumerate() {
                 if let Some(&s) = track.get(idx0 + i) {
                     *m += s as i32;

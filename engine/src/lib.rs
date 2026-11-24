@@ -486,10 +486,10 @@ impl ClientSession {
         let _ = self.socket.send(&jt_core::make_record_cmd(cmd));
     }
 
-    /// 开始/停止全员同步回放录制结果。
-    pub fn set_playback(&self, on: bool) {
+    /// 开始/停止回放指定历史录制（rid 为录制 id，服务器上按 1/2/… 递增）。
+    pub fn set_playback(&self, rid: u32, on: bool) {
         let cmd = if on { jt_core::CMD_START } else { jt_core::CMD_STOP };
-        let _ = self.socket.send(&jt_core::make_playback_cmd(cmd));
+        let _ = self.socket.send(&jt_core::make_playback_cmd(rid, cmd));
     }
 
     /// This client's server-assigned id (0 until the welcome arrives).
