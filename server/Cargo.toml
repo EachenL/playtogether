@@ -6,3 +6,11 @@ description = "JackTrip-style mixing hub server"
 
 [dependencies]
 jt-core = { path = "../core" }
+
+[features]
+# 编译期"时间可组合性"：每个功能一个 feature，可独立开关。
+# 例如：cargo build --no-default-features --features "room,roster"
+default = ["room", "roster", "gain"]
+room = []
+roster = []
+gain = []

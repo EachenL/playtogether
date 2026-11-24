@@ -1,50 +1,27 @@
 //! jt-server — a JackTrip-style mixing hub with rehearsal-room isolation,
 //! named participants, and per-peer server-side gain mixing.
 //!
-//! Each client sends one mono audio stream (uncompressed PCM over UDP) tagged
-//! with a 4-digit room code. The server keeps the latest block from every
-//! client, and on each received packet mixes every *other* same-room client's
-//! audio — applying the *receiver's* per-peer gains — and sends the result back
-//! to the sender. It also assigns each client an id, tracks their display name,
-//! and broadcasts the room roster (id + name) so peers can see who joined and
-//! set per-peer volume.
+//! 架构：核心循环（本文件）负责**音频热路径**（JT01 混音）+ ping 回显 +
+//! 超时清理；其余"功能"（改名/花名册、独立音量、房间策略）都是**插件**，
+//! 通过 `plugins::all()` 编译期组合，见 `plugin.rs` 与 `plugins/`。
 //!
 //! Usage:
 //!   jt-server [--port N] [--echo] [--room-timeout SECS] [--max-room-clients N]
 
+mod hub;
+mod plugin;
+mod plugins;
+
 use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
-use jt_core::{parse_gain, parse_name, parse_ping, AudioBlock, Sample};
+use jt_core::{parse_ping, AudioBlock, Sample};
+
+use crate::hub::{ClientState, Hub};
 
 /// A client is dropped if no packet arrives for this long.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
-
-struct ClientState {
-    room: u32,
-    client_id: u32,
-    name: String,
-    last_block: Vec<Sample>,
-    last_seen: Instant,
-    /// This client's per-peer gains: peer client_id → gain multiplier.
-    gains: HashMap<u32, f32>,
-}
-
-fn broadcast_roster(socket: &UdpSocket, clients: &HashMap<SocketAddr, ClientState>, room: u32) {
-    let mut entries: Vec<(u32, String)> = clients
-        .values()
-        .filter(|cs| cs.room == room)
-        .map(|cs| (cs.client_id, cs.name.clone()))
-        .collect();
-    entries.sort_by_key(|(id, _)| *id);
-    let pkt = jt_core::make_roster(&entries);
-    for (addr, cs) in clients.iter() {
-        if cs.room == room {
-            let _ = socket.send_to(&pkt, *addr);
-        }
-    }
-}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut port: u16 = 9000;
@@ -89,14 +66,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_room_clients
     );
 
-    let mut clients: HashMap<SocketAddr, ClientState> = HashMap::new();
-    let mut rooms: HashMap<u32, Instant> = HashMap::new(); // room code → last active
-    let mut next_client_id: u32 = 1;
+    let mut hub = Hub {
+        socket,
+        clients: HashMap::new(),
+        rooms: HashMap::new(),
+        next_client_id: 1,
+        max_room_clients,
+        room_timeout: Duration::from_secs(room_timeout_secs),
+        echo,
+    };
+    let mut plugins = plugins::all();
+    let names: Vec<&str> = plugins.iter().map(|p| p.name()).collect();
+    println!("plugins loaded: {}", names.join(", "));
+
     let mut buf = [0u8; 65536];
-    let mut last_prune = Instant::now();
+    let mut last_tick = Instant::now();
 
     loop {
-        let (n, src) = match socket.recv_from(&mut buf) {
+        let (n, src) = match hub.socket.recv_from(&mut buf) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("recv error: {e}");
@@ -104,44 +91,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        // Echo ping packets back so clients can measure RTT.
-        if let Some(_ts) = parse_ping(&buf[..n]) {
-            let _ = socket.send_to(&buf[..n], src);
+        // 1. ping 回显（核心，供客户端测 RTT）。
+        if parse_ping(&buf[..n]).is_some() {
+            let _ = hub.socket.send_to(&buf[..n], src);
             continue;
         }
 
-        // Display-name announcement.
-        if let Some(name) = parse_name(&buf[..n]) {
-            if let Some(cs) = clients.get_mut(&src) {
-                cs.name = name;
-                let room = cs.room;
-                broadcast_roster(&socket, &clients, room);
+        // 2. 控制消息 → 插件链（改名/音量等）。
+        let mut handled = false;
+        for p in plugins.iter_mut() {
+            if p.on_message(&mut hub, src, &buf, n) {
+                handled = true;
+                break;
             }
+        }
+        if handled {
             continue;
         }
 
-        // Per-peer gain update.
-        if let Some((peer, gain)) = parse_gain(&buf[..n]) {
-            if let Some(cs) = clients.get_mut(&src) {
-                cs.gains.insert(peer, gain);
-            }
-            continue;
-        }
-
+        // 3. 音频热路径（JT01）—— 不经插件，保持 <20ms 延迟。
         let Some((room, block)) = AudioBlock::deserialize(&buf[..n]) else {
             continue; // not our packet
         };
 
-        // New client registration.
-        if !clients.contains_key(&src) {
-            let in_room = clients.values().filter(|cs| cs.room == room).count();
-            if in_room >= max_room_clients {
-                let _ = socket.send_to(&jt_core::make_room_full(), src);
-                continue; // room full — reject
+        // 新客户端注册：先让插件决定是否允许加入。
+        if !hub.clients.contains_key(&src) {
+            let mut reject = None;
+            for p in plugins.iter_mut() {
+                if let Some(pkt) = p.on_join(&mut hub, room) {
+                    reject = Some(pkt);
+                    break;
+                }
             }
-            let cid = next_client_id;
-            next_client_id += 1;
-            clients.insert(
+            if let Some(pkt) = reject {
+                let _ = hub.socket.send_to(&pkt, src);
+                continue;
+            }
+
+            let cid = hub.next_client_id;
+            hub.next_client_id += 1;
+            hub.clients.insert(
                 src,
                 ClientState {
                     room,
@@ -152,25 +141,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     gains: HashMap::new(),
                 },
             );
-            let _ = socket.send_to(&jt_core::make_welcome(cid), src);
-            broadcast_roster(&socket, &clients, room);
+            let _ = hub.socket.send_to(&jt_core::make_welcome(cid), src);
+            hub.broadcast_roster(room);
         }
 
-        // Existing client: refresh block + timestamp.
+        // 刷新该客户端的音频块 + 时间戳。
         {
-            let cs = clients.get_mut(&src).unwrap();
+            let cs = hub.clients.get_mut(&src).unwrap();
             cs.last_block = block.samples;
             cs.last_seen = Instant::now();
         }
 
-        // Mix for the sender, applying the sender's per-peer gains.
+        // 为发送者混音（应用其 per-peer gain）。
         let (room, gains) = {
-            let cs = clients.get(&src).unwrap();
+            let cs = hub.clients.get(&src).unwrap();
             (cs.room, cs.gains.clone())
         };
         let mut mix: Vec<i32> = Vec::new();
-        for (addr, cs) in clients.iter() {
-            if cs.room != room || (!echo && *addr == src) {
+        for (addr, cs) in hub.clients.iter() {
+            if cs.room != room || (!hub.echo && *addr == src) {
                 continue;
             }
             let gain = gains.get(&cs.client_id).copied().unwrap_or(1.0);
@@ -190,41 +179,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let resp = AudioBlock::new(0, clamped);
             let mut out = Vec::new();
             resp.serialize_into(room, &mut out);
-            let _ = socket.send_to(&out, src);
+            let _ = hub.socket.send_to(&out, src);
         }
 
-        // Periodic housekeeping (every second).
-        if last_prune.elapsed() >= Duration::from_secs(1) {
-            last_prune = Instant::now();
+        // 4. 每秒 housekeeping：核心剔除超时客户端 + 插件 tick。
+        if last_tick.elapsed() >= Duration::from_secs(1) {
+            last_tick = Instant::now();
 
-            let before = clients.len();
-            clients.retain(|_, cs| cs.last_seen.elapsed() < CLIENT_TIMEOUT);
+            // 核心：剔除超时客户端。
+            let before = hub.clients.len();
+            hub.clients.retain(|_, cs| cs.last_seen.elapsed() < CLIENT_TIMEOUT);
 
-            // Refresh each active room's last-active timestamp.
-            for cs in clients.values() {
-                rooms.insert(cs.room, Instant::now());
+            // 插件 tick（如 RoomPlugin 刷新/释放空闲房间）。
+            for p in plugins.iter_mut() {
+                p.on_tick(&mut hub);
             }
 
-            // Release rooms idle longer than the timeout.
-            let timeout = Duration::from_secs(room_timeout_secs);
-            rooms.retain(|room, last_active| {
-                if last_active.elapsed() >= timeout {
-                    println!("room {room:04} released (idle > {room_timeout_secs}s)");
-                    false
-                } else {
-                    true
-                }
-            });
-
-            // If membership changed, push an updated roster to every live room.
-            if clients.len() != before {
-                let room_ids: Vec<u32> = rooms.keys().copied().collect();
+            // 成员变化 → 推送更新后的花名册。
+            if hub.clients.len() != before {
+                let room_ids: Vec<u32> = hub.rooms.keys().copied().collect();
                 for r in room_ids {
-                    broadcast_roster(&socket, &clients, r);
+                    hub.broadcast_roster(r);
                 }
             }
 
-            println!("clients: {} | rooms: {}", clients.len(), rooms.len());
+            println!("clients: {} | rooms: {}", hub.clients.len(), hub.rooms.len());
         }
     }
 }
